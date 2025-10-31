@@ -71,6 +71,12 @@ PATTERNS = [
     r"\b[A-Z0-9_]{2,32}\s*=\s*[^ \t\r\n#]{1,}\b",
     # Billing hints: names and address fragments (coarse)
     r"\b(?:Address|Billing|Cardholder|Name|Street|St\.|Ave|Avenue|Road|Rd\.|Postcode|ZIP|City|State|Country)\b",
+    # Street address structures
+    r"(?i)\b\d{1,6}\s+(?:[A-Za-z0-9]+\.?\s+){1,4}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir|Way|Trail|Trl|Parkway|Pkwy|Place|Pl|Terrace|Ter)\b",
+    # City, state, ZIP formats
+    r"(?i)\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?\b",
+    # Apartment/unit formats
+    r"(?i)\b(?:apt|apartment|suite|ste|unit|floor|fl)\s*[#\-\s]?\s*\w{1,6}\b",
     # Credit card numbers (grouped 4s or flexible digits)
     r"(?i)\b(?:\d{4}[- ]?){3}\d{4}\b",
     r"(?i)\b(?:\d{4}[- ]?){2}\d{5}\b",
@@ -115,6 +121,38 @@ NAME_FIELD_KEYWORDS = {
     "full name",
 }
 NAME_EXCLUDE_TOKENS = {"cvv", "cvc", "cid"}
+AUTOFILL_KEYWORDS = {
+    "autofill",
+    "auto-fill",
+    "auto fill",
+    "suggested",
+    "suggestion",
+    "suggestions",
+    "use suggested",
+    "use suggestion",
+    "saved info",
+    "saved information",
+    "saved address",
+    "saved addresses",
+    "saved payment",
+    "fill form",
+    "form fill",
+}
+GENERIC_SAFE_WORDS = {
+    "privacy",
+    "policy",
+    "terms",
+    "conditions",
+    "help",
+    "support",
+    "continue",
+    "cancel",
+    "learn",
+    "more",
+    "settings",
+    "options",
+    "password",
+}
 
 
 @dataclass
@@ -190,6 +228,7 @@ def find_secret_boxes(ocr: Dict[str, Any], scale_x: float, scale_y: float) -> Li
     joined_tokens = " ".join(tokens_lower)
     billing_context = any(keyword in joined_tokens for keyword in BILLING_KEYWORDS)
     name_field_context = any(keyword in joined_tokens for keyword in NAME_FIELD_KEYWORDS)
+    autofill_context = any(keyword in joined_tokens for keyword in AUTOFILL_KEYWORDS)
     # Build per-line aggregates to cover entire sensitive lines
     by_line: Dict[Tuple[int, int, int], List[int]] = {}
     for i in range(n):
@@ -233,16 +272,25 @@ def find_secret_boxes(ocr: Dict[str, Any], scale_x: float, scale_y: float) -> Li
         if not line_text:
             continue
         line_text_lower = line_text.lower()
+        line_sensitive = False
         if any(keyword in line_text_lower for keyword in BILLING_KEYWORDS):
             billing_context = True
-
-        line_sensitive = any(p.search(line_text) for p in PATTERNS_COMPILED)
-
-        if (billing_context or name_field_context) and BILLING_NAME_PATTERN.search(line_text):
+        if any(keyword in line_text_lower for keyword in NAME_FIELD_KEYWORDS):
+            name_field_context = True
+            line_sensitive = True
+        if any(keyword in line_text_lower for keyword in AUTOFILL_KEYWORDS):
+            autofill_context = True
             line_sensitive = True
 
+        if any(p.search(line_text) for p in PATTERNS_COMPILED):
+            line_sensitive = True
+
+        if (billing_context or name_field_context or autofill_context) and BILLING_NAME_PATTERN.search(line_text):
+            line_sensitive = True
+
+        stripped_words = [w.strip(".,'\"") for w in line_text.split()]
+
         if not line_sensitive and name_field_context:
-            stripped_words = [w.strip(".,'\"") for w in line_text.split()]
             if 1 <= len(stripped_words) <= 3:
                 word_matches = [
                     bool(BILLING_SINGLE_NAME_PATTERN.match(w)) and w.lower() not in NAME_EXCLUDE_TOKENS
@@ -257,6 +305,21 @@ def find_secret_boxes(ocr: Dict[str, Any], scale_x: float, scale_y: float) -> Li
                 hint in line_text_lower for hint in CARD_LAST4_HINTS
             ):
                 line_sensitive = True
+
+        if not line_sensitive:
+            title_candidates = [
+                w
+                for w in stripped_words
+                if w
+                and bool(BILLING_SINGLE_NAME_PATTERN.match(w))
+                and w.lower() not in NAME_EXCLUDE_TOKENS
+            ]
+            meaningful_candidates = [
+                w for w in title_candidates if w.lower() not in GENERIC_SAFE_WORDS
+            ]
+            if len(title_candidates) >= 2 and meaningful_candidates:
+                if billing_context or name_field_context or autofill_context or len(title_candidates) >= 3:
+                    line_sensitive = True
 
         if line_sensitive:
             xs, ys, xe, ye = [], [], [], []
