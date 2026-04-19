@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+# Build artifacts
+dist/
+
+# If you keep ML models in-repo, don't commit them by accident.
+*.onnx
