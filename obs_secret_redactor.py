@@ -13,6 +13,11 @@ Notes:
 - All processing is local. No network calls.
 """
 
+if __name__ == "__main__":
+    # Retire the post-broadcast overlay entry point. Never parse old credentials.
+    print("The old overlay prototype is disabled. Open Safestream.command for buffered redaction.")
+    raise SystemExit(1)
+
 import argparse
 import base64
 import signal
