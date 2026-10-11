@@ -32,6 +32,14 @@ class RedactionTests(unittest.TestCase):
         self.assertEqual(safe.getpixel((40, 195)), (0, 0, 0))
         self.assertEqual(safe.getpixel((700, 195)), (255, 255, 255))
 
+    def test_other_key_formats_and_bare_2fa_are_covered(self):
+        _, _, counts = self.run_frame(["sk-proj-abcdefghijklmnop123456789",
+                                       "Bearer abcdefghijk123456789",
+                                       "ABCDEF0123456789+/ABCDEF0123456789==",
+                                       "["+",".join(str(i) for i in range(64))+"]",
+                                       "654321"], mode="selective")
+        self.assertEqual(counts["masked_lines"], 5)
+
     def run_frame(self, lines, **options):
         image = Image.new("RGB", (800, max(300, len(lines) * 40 + 60)), "white")
         windows = options.pop("windows", ())

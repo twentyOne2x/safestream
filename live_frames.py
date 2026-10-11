@@ -11,6 +11,7 @@ from collections import OrderedDict
 from io import BytesIO
 
 from PIL import Image, ImageDraw
+from geometry import visible_private_regions
 
 
 def rectangles(values, size, allow_id=False):
@@ -33,6 +34,8 @@ def rectangles(values, size, allow_id=False):
     return result
 
 
+
+
 class PixelGate:
     """Changing pixels are opaque until a matching local scan certifies them.
 
@@ -45,14 +48,15 @@ class PixelGate:
         self.size, self.redactor, self.tile = size, redactor, tile
         self.lock = threading.Lock()
         self.cache = OrderedDict()
+        self.window_cache = OrderedDict()
         self.private_ids = set()
         self.counts = {}
         self.boxes = [(x, y, min(x+tile, size[0]), min(y+tile, size[1]))
                       for y in range(0, size[1], tile) for x in range(0, size[0], tile)]
 
-    def normalized(self, image, windows, masks=()):
+    def normalized(self, image, windows, masks=(), excluded_ids=()):
         with self.lock:
-            hard = [w for w in windows if w.get("id") in self.private_ids] + list(masks)
+            hard = visible_private_regions(windows, self.private_ids, excluded_ids) + list(masks)
         if not hard:
             return image
         result = image.copy()
@@ -79,9 +83,22 @@ class PixelGate:
             result.append(digest.digest())
         return result
 
-    def certify(self, image, windows, epoch):
-        image = self.normalized(image, windows)
+    def window_keys(self, image, windows, epoch):
+        result = []
+        for i,w in enumerate(windows):
+            box = (w["x"],w["y"],w["x"]+w["w"],w["y"]+w["h"])
+            digest = hashlib.blake2b(image.crop(box).tobytes(),digest_size=20)
+            foreground = [(f.get("id"),f["x"]-w["x"],f["y"]-w["y"],f["w"],f["h"])
+                          for f in windows[:i] if f["x"] < box[2] and f["x"]+f["w"] > box[0]
+                          and f["y"] < box[3] and f["y"]+f["h"] > box[1]]
+            digest.update(json.dumps([epoch,w.get("id"),w["w"],w["h"],foreground]).encode())
+            result.append((digest.digest(),box))
+        return result
+
+    def certify(self, image, windows, epoch, excluded_ids=()):
+        image = self.normalized(image, windows, excluded_ids=excluded_ids)
         keys = self.keys(image, windows, epoch)
+        window_keys = self.window_keys(image, windows, epoch)
         started = time.monotonic()
         processed, counts = self.redactor.redact(image, windows=windows)
         if processed.size != self.size:
@@ -93,13 +110,19 @@ class PixelGate:
                 self.cache.move_to_end((box, key))
             while len(self.cache) > len(self.boxes)*3:
                 self.cache.popitem(last=False)
+            for key,box in window_keys:
+                self.window_cache[key] = processed.crop(box)
+                self.window_cache.move_to_end(key)
+            while len(self.window_cache) > 128:
+                self.window_cache.popitem(last=False)
             self.counts = {**counts, "ocr_ms": round((time.monotonic()-started)*1000)}
 
-    def render(self, image, windows, epoch, masks=()):
+    def render(self, image, windows, epoch, masks=(), excluded_ids=()):
         if image.size != self.size:
             raise ValueError("Captured frame size changed")
-        image = self.normalized(image, windows, masks)
+        image = self.normalized(image, windows, masks, excluded_ids)
         keys = self.keys(image, windows, epoch)
+        window_keys = self.window_keys(image, windows, epoch)
         safe = Image.new("RGB", self.size, "black")
         pending = 0
         with self.lock:
@@ -110,12 +133,28 @@ class PixelGate:
                 else:
                     safe.paste(crop, box)
             counts = dict(self.counts)
-            hard = [w for w in windows if w.get("id") in self.private_ids] + list(masks)
+            # Exact whole-window pixels can move without another OCR pass. Draw
+            # back-to-front; an unchecked foreground window still stays opaque.
+            approved_windows = 0
+            for key,box in reversed(window_keys):
+                crop = self.window_cache.get(key)
+                if crop is None:
+                    safe.paste("black",box)
+                else:
+                    safe.paste(crop,box)
+                    approved_windows += 1
+            hard = visible_private_regions(windows, self.private_ids, excluded_ids) + list(masks)
         draw = ImageDraw.Draw(safe)
         for w in hard:
             draw.rectangle((math.floor(w["x"]), math.floor(w["y"]),
                             math.ceil(w["x"]+w["w"])-1, math.ceil(w["y"]+w["h"])-1), fill="black")
+        # Fixed screen regions remain hard masks after a cached window moves.
+        for x, y, w, h in getattr(self.redactor, "regions", ()):
+            draw.rectangle((math.floor(x * self.size[0]), math.floor(y * self.size[1]),
+                            min(self.size[0]-1, math.ceil((x+w) * self.size[0])),
+                            min(self.size[1]-1, math.ceil((y+h) * self.size[1]))), fill="black")
         return safe, {**counts, "pending_tiles": pending, "total_tiles": len(self.boxes),
+                      "certified_windows":approved_windows,"pending_windows":len(windows)-approved_windows,
                       "tracked_private_windows": len(hard)}
 
 
@@ -145,6 +184,10 @@ def read_packet(pipe, size):
             or captured > time.monotonic()+0.1 or captured < 0
             or (metadata.get("fail_closed") is not True and time.monotonic()-captured > 3)):
         raise ValueError("Capture is not fresh")
+    excluded = metadata.get("excluded_window_ids", [])
+    if not isinstance(excluded, list) or len(excluded) > 4096 or any(type(i) is not int or i <= 0 for i in excluded):
+        raise ValueError("Invalid exclusion receipt")
+    metadata["excluded_window_ids"] = excluded
     metadata["windows"] = rectangles(metadata.get("windows", []), size, allow_id=True)
     metadata["masks"] = rectangles(metadata.get("masks", []), size)
     if type(metadata.get("scene_epoch", 0)) is not int or type(metadata.get("fail_closed")) is not bool:
@@ -203,13 +246,13 @@ def run_live(frames, redactor, display, stop, fps, root, policy_path, pause_path
             if packet is None or packet[1]["fail_closed"] or pause_path.exists():
                 continue
             image, meta = packet
-            image = gate.normalized(image, meta["windows"], meta["masks"])
+            image = gate.normalized(image, meta["windows"], meta["masks"], meta["excluded_window_ids"])
             digest = hashlib.blake2b(image.tobytes(), digest_size=20).digest()
-            identity = (digest, meta.get("scene_epoch", 0), json.dumps(meta["windows"], sort_keys=True))
+            identity = (digest, meta.get("scene_epoch", 0), json.dumps([meta["windows"], meta["excluded_window_ids"]], sort_keys=True))
             if identity == previous:
                 continue
             try:
-                gate.certify(image, meta["windows"], meta.get("scene_epoch", 0))
+                gate.certify(image, meta["windows"], meta.get("scene_epoch", 0), meta["excluded_window_ids"])
                 previous = identity
             except Exception:
                 frames.pause("processing-failed")
@@ -233,7 +276,7 @@ def run_live(frames, redactor, display, stop, fps, root, policy_path, pause_path
                 if meta["fail_closed"] or started-meta["capture_monotonic"] > 1:
                     frames.pause("capture-unavailable")
                 else:
-                    safe, counts = gate.render(image, meta["windows"], meta.get("scene_epoch", 0), meta["masks"])
+                    safe, counts = gate.render(image, meta["windows"], meta.get("scene_epoch", 0), meta["masks"], meta["excluded_window_ids"])
                     counts.update(capture_ms=round((started-meta["capture_monotonic"])*1000),
                                   processing_ms=round((time.monotonic()-started)*1000),
                                   capture_sequence=meta.get("sequence", 0))

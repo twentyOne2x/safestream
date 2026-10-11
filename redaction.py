@@ -11,6 +11,7 @@ from io import BytesIO, StringIO
 from pathlib import Path
 
 from PIL import Image, ImageDraw
+from geometry import visible_private_regions
 
 
 def _fold(value):
@@ -34,6 +35,11 @@ PATTERNS = tuple(re.compile(pattern, re.I) for pattern in (
     r"\b\d{4,5}\s+[a-z][a-z-]+\b",
     r"\b(?:apt|apartment|suite|unit|appartement|wohnung)\s*[#:-]?\s*\w+",
     r"\b(?:sk_(?:live|test)_|gh[pousr]_|AKIA|AIza|xox[baprs]-)[\w-]+",
+    r"\bsk-[a-z0-9_-]{12,}\b",
+    r"\b(?:bearer|basic)\s+[a-z0-9_+/=.-]{8,}\b",
+    r"(?<!\w)(?=[a-z0-9_+/=-]{24,}(?!\w))(?=[a-z0-9_+/=-]*\d)(?=[a-z0-9_+/=-]*[a-z])[a-z0-9_+/=-]{24,}(?!\w)",
+    r"\[\s*(?:\d{1,3}\s*,\s*){15,}\d{1,3}\s*\]",
+    r"(?<!\d)\d{6}(?!\d)",
     r"\beyJ[\w-]+\.[\w-]+\.[\w-]+\b",
     r"\b(?:0x)?[a-f0-9]{32,128}\b",
     r"-----\s*(?:BEGIN|END)\s+(?:[A-Z ]*\s)?(?:PRIVATE|PUBLIC) KEY\s*-----",
@@ -74,7 +80,7 @@ class Redactor:
         whole_windows_terms = tuple(whole_windows_terms)
         if any(not isinstance(term, str) for term in whole_windows_terms):
             raise ValueError("Invalid private window term")
-        self.whole_windows_terms = tuple(re.compile(r"(?<!\w)" + re.escape(_fold(term.strip())) + r"(?!\w)")
+        self.whole_windows_terms = tuple(re.compile(r"(?<![a-z])"+re.escape(_fold(term.strip()))+r"(?![a-z])")
                                          for term in whole_windows_terms if term.strip())
         self.last_window_masks = ()
         self.last_private_window_ids = ()
@@ -169,6 +175,7 @@ class Redactor:
             window_rects.append((x, y, x + w, y + h))
             window_ids.append(window_id)
         whole_window_regions = set()
+        private_window_indices = set()
         private_window_ids = set()
         try:
             data = self._ocr(image)
@@ -212,6 +219,7 @@ class Redactor:
                     # Metadata is frontmost first; obscured background windows
                     # cannot own visible text merely because they are smaller.
                     j = owners[i] - 1
+                    private_window_indices.add(j)
                     region = window_rects[j]
                     if window_ids[j] is not None:
                         private_window_ids.add(window_ids[j])
@@ -287,8 +295,13 @@ class Redactor:
             draw.rectangle((math.floor(x * image.width), math.floor(y * image.height),
                             min(image.width - 1, math.ceil((x + w) * image.width)),
                             min(image.height - 1, math.ceil((y + h) * image.height))), fill="black")
-        for x1, y1, x2, y2 in whole_window_regions:
-            draw.rectangle((x1, y1, x2 - 1, y2 - 1), fill="black")
+        geometry = [{"id":i,"x":rect[0],"y":rect[1],"w":rect[2]-rect[0],"h":rect[3]-rect[1]}
+                    for i,rect in enumerate(window_rects)]
+        visible_regions = visible_private_regions(geometry, private_window_indices)
+        for region in visible_regions:
+            draw.rectangle((math.floor(region["x"]), math.floor(region["y"]),
+                            math.ceil(region["x"]+region["w"])-1,
+                            math.ceil(region["y"]+region["h"])-1), fill="black")
         self.last_window_masks = tuple({"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
                                        for x1, y1, x2, y2 in sorted(whole_window_regions))
         self.last_private_window_ids = tuple(sorted(private_window_ids))

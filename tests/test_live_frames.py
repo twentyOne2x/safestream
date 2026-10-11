@@ -6,7 +6,7 @@ import time
 import pytest
 from PIL import Image
 
-from live_frames import PixelGate, read_packet, rectangles
+from live_frames import PixelGate, read_packet, rectangles, visible_private_regions
 
 
 class SyntheticRedactor:
@@ -54,12 +54,41 @@ def test_private_window_moves_without_reusing_approval_and_remains_sticky():
     assert gate.render(raw, [moved], 1)[0].getpixel((300, 100)) == (0, 0, 0)
 
 
+def test_certified_public_window_moves_with_exact_owning_context():
+    gate=PixelGate((512,256),SyntheticRedactor())
+    window={"id":42,"x":0,"y":0,"w":128,"h":128}
+    raw=Image.new("RGB",gate.size,"grey")
+    raw.paste("white",(0,0,128,128))
+    gate.certify(raw,[window],1)
+    moved={**window,"x":256}
+    current=Image.new("RGB",gate.size,"grey")
+    current.paste("white",(256,0,384,128))
+    safe,_=gate.render(current,[moved],1)
+    assert safe.getpixel((356,100))==(255,255,255)
+    assert safe.getpixel((266,10))==(0,0,0)
+    current.paste("red",(280,30,300,50))
+    assert gate.render(current,[moved],1)[0].getpixel((356,100))==(0,0,0)
+
+
 def test_native_masks_override_already_certified_pixels():
     gate = PixelGate((256, 256), SyntheticRedactor())
     raw = Image.new("RGB", gate.size, "white")
     gate.certify(raw, [], 1)
     masked = gate.render(raw, [], 1, [{"x": 100, "y": 100, "w": 50, "h": 50}])[0]
     assert masked.getpixel((120, 120)) == (0, 0, 0)
+
+
+def test_public_foreground_stays_visible_over_private_background_window():
+    public={"id":2,"x":100,"y":100,"w":100,"h":100}
+    private={"id":1,"x":0,"y":0,"w":300,"h":300}
+    regions=visible_private_regions([public,private],{1},{1})
+    image=Image.new("RGB",(300,300),"white")
+    from PIL import ImageDraw
+    draw=ImageDraw.Draw(image)
+    for r in regions:
+        draw.rectangle((r["x"],r["y"],r["x"]+r["w"]-1,r["y"]+r["h"]-1),fill="black")
+    assert image.getpixel((150,150))==(255,255,255)
+    assert image.getpixel((99,150))==(0,0,0)
 
 
 def test_protocol_rejects_stale_wrong_geometry_and_truncated_frame():
@@ -103,3 +132,30 @@ def test_distant_recovery_label_invalidates_cached_body_in_production_redactor()
         assert gate.render(changed, windows, 1)[0].getpixel((40, 275)) == (0, 0, 0)
         gate.certify(changed, windows, 1)
     assert gate.render(changed, windows, 1)[0].getpixel((40, 275)) == (0, 0, 0)
+
+
+def test_fixed_manual_region_overrides_a_translated_public_window_cache():
+    from unittest.mock import patch
+    from redaction import Redactor
+    from tests.test_redaction import ocr
+    redactor = Redactor(mode="selective", regions=[{"x": .5, "y": 0, "w": .25, "h": .5}])
+    gate = PixelGate((512, 256), redactor)
+    window = {"id": 42, "x": 0, "y": 0, "w": 128, "h": 128}
+    raw = Image.new("RGB", gate.size, "grey")
+    raw.paste("white", (0, 0, 128, 128))
+    with patch.object(redactor, "_ocr", return_value=ocr([])):
+        gate.certify(raw, [window], 1)
+        moved = {**window, "x": 256}
+        current = Image.new("RGB", gate.size, "grey")
+        current.paste("white", (256, 0, 384, 128))
+        expected, _ = redactor.redact(current, windows=[moved])
+    assert expected.getpixel((300, 50)) == (0, 0, 0)
+    assert gate.render(current, [moved], 1)[0].getpixel((300, 50)) == (0, 0, 0)
+    assert gate.render(raw, [window], 1)[0].getpixel((100, 100)) == (255, 255, 255)
+
+
+def test_unexcluded_private_window_cannot_be_unmasked_by_transparent_foreground():
+    public = {"id": 2, "x": 100, "y": 100, "w": 100, "h": 100}
+    private = {"id": 1, "x": 0, "y": 0, "w": 300, "h": 300}
+    assert visible_private_regions([public, private], {1}) == [
+        {"x": 0, "y": 0, "w": 300, "h": 300}]
