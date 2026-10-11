@@ -20,6 +20,8 @@ def _fold(value):
 
 PATTERNS = tuple(re.compile(pattern, re.I) for pattern in (
     r"\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b",
+    r"(?<![\w@])@[a-z0-9_][a-z0-9_.]{0,29}\b",
+    r"\b(?:https?://)?(?:www\.)?(?:instagram\.com|instagr\.am)/[a-z0-9_.]+\b",
     r"\b(?:\d[ -]?){13,19}\b",
     r"(?:\+\d[\d ()-]{6,}\d)|(?:\b\d{2,4}[ .()-]\d{2,4}[ .()-]\d{2,4}\b)",
     r"(?:[*•●xX][ -]?){2,}\d{4}\b",
@@ -27,24 +29,36 @@ PATTERNS = tuple(re.compile(pattern, re.I) for pattern in (
     r"\b(?:card|carte|karte|credit|debit|visa|mastercard|amex)\b.*\b\d{4}\b",
     r"\b(?:0[1-9]|1[0-2])[/.-](?:\d{4}|\d{2})\b",
     r"\b(?:cvv|cvc|cid|security code|cryptogramme|prufnummer)\b",
-    r"\b(?:first name|last name|full name|cardholder|name on card|prenom|nom|titulaire|vorname|nachname|karteninhaber)\b",
-    r"\b(?:address|adresse|billing|facturation|street|avenue|boulevard|road|postcode|postal|zip|rue|chemin|strasse|straße|gasse|platz|hausnummer|postleitzahl|plz)\b",
+    r"\b\d{1,5}\s+.*\b(?:street|avenue|boulevard|road|rue|chemin|strasse|straße|gasse|platz)\b",
     r"\b[a-z]*(?:strasse|straße|gasse|platz|weg)\s+\d{1,5}\b",
     r"\b\d{4,5}\s+[a-z][a-z-]+\b",
     r"\b(?:apt|apartment|suite|unit|appartement|wohnung)\s*[#:-]?\s*\w+",
     r"\b(?:sk_(?:live|test)_|gh[pousr]_|AKIA|AIza|xox[baprs]-)[\w-]+",
     r"\beyJ[\w-]+\.[\w-]+\.[\w-]+\b",
-    r"-----BEGIN.*PRIVATE KEY-----",
-    r"\b[A-Z0-9_]{2,50}\s*[=:]\s*\S+",
+    r"\b(?:0x)?[a-f0-9]{32,128}\b",
+    r"-----\s*(?:BEGIN|END)\s+(?:[A-Z ]*\s)?(?:PRIVATE|PUBLIC) KEY\s*-----",
 ))
-# Deliberately conservative: ordinary title text may be hidden in selective mode.
-PERSON = re.compile(r"(?<!\w)(?:[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+(?:[-'][A-ZÀ-ÖØ-Þ]?[a-zà-öø-ÿ]+)?\s+){1,3}[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+(?!\w)")
-UPPER_PERSON = re.compile(r"\b[A-ZÀ-ÖØ-Þ]{2,}(?:\s+[A-ZÀ-ÖØ-Þ]{2,}){1,3}\b")
-FIELD = re.compile(r"\b(?:name|prenom|nom|vorname|nachname|address|adresse|cardholder|titulaire|karteninhaber)\b", re.I)
+# Names without a field label are supplied as private terms. Capitalization alone
+# cannot distinguish a person's name from a public heading.
+FIELD = re.compile(r"^\s*(?:(?:first|last|full|display|user)\s+name|name|prenom|nom|vorname|nachname|address|adresse|billing address|cardholder|titulaire|karteninhaber|cvv|cvc|cid|security code|expiry|expiration|card number|handle|instagram|challenger(?:\s+handle)?|password|passwd|passphrase|mot de passe|otp|2fa|two[- ]factor(?:\s+(?:code|secret))?|one[- ]time(?:\s+(?:code|password))?|verification code|authentication code|authenticator(?:\s+(?:code|secret))?|(?:private|public|api|secret|access|signing)[_ -]?key|(?:access|auth|bearer|refresh)[_ -]?token|seed(?:\s+phrase)?|recovery phrase|mnemonic)\s*(?:[=:：-]\s*.*)?$", re.I)
+SECRET_ASSIGNMENT = re.compile(r"\b(?:password|passwd|passphrase|otp|2fa|(?:private|public|api|secret|access|signing)[_ -]?key|(?:access|auth|bearer|refresh)[_ -]?token|seed phrase|recovery phrase|mnemonic)\s*[=:：]\s*\S+", re.I)
+SECRET_ENV = re.compile(r"\b[A-Z][A-Z0-9_]*(?:_KEY|_TOKEN|_PASSWORD|_PASSWD|_SECRET|_OTP)\s*[=:]\s*\S+", re.I)
+BASE58_KEY = re.compile(r"(?<![A-Za-z0-9])[1-9A-HJ-NP-Za-km-z]{32,88}(?![A-Za-z0-9])")
+PEM_BEGIN = re.compile(r"-----\s*BEGIN\s+(?:[A-Z ]*\s)?(?:PRIVATE|PUBLIC) KEY\s*-----", re.I)
+PEM_END = re.compile(r"-----\s*END\s+(?:[A-Z ]*\s)?(?:PRIVATE|PUBLIC) KEY\s*-----", re.I)
+SEED_FIELD = re.compile(r"^\s*(?:seed(?:\s+phrase)?|recovery phrase|mnemonic)\s*(?:[=:：-]\s*.*)?$", re.I)
+WHOLE_SECRET_FIELD = re.compile(r"\b(?:password|passwd|passphrase|otp|2fa|two[- ]factor|one[- ]time|verification code|authentication code|authenticator|(?:private|public|api|secret|signing)[_ -]?key|seed|recovery phrase|mnemonic)\b", re.I)
+
+
+def _nearby(label, following):
+    """Only carry a label into a value in the same visual column."""
+    return (0 <= following[1] - label[3] <= max(80, (label[3] - label[1]) * 4)
+            and following[0] < label[2] and following[2] > label[0])
 
 
 class Redactor:
-    def __init__(self, mode="protective", terms=(), regions=(), backend="tesseract"):
+    def __init__(self, mode="protective", terms=(), regions=(), backend="tesseract",
+                 whole_windows_terms=("Challenger", "Instagram", "Gmail", "LastPass", "1Password", "mail.google.com")):
         if backend not in ("tesseract", "vision"):
             raise ValueError("Invalid local recognition backend")
         self.backend = backend
@@ -55,6 +69,15 @@ class Redactor:
         terms = tuple(terms)
         if any(not isinstance(term, str) for term in terms):
             raise ValueError("Invalid private term")
+        if isinstance(whole_windows_terms, str):
+            raise ValueError("Window terms must be a collection")
+        whole_windows_terms = tuple(whole_windows_terms)
+        if any(not isinstance(term, str) for term in whole_windows_terms):
+            raise ValueError("Invalid private window term")
+        self.whole_windows_terms = tuple(re.compile(r"(?<!\w)" + re.escape(_fold(term.strip())) + r"(?!\w)")
+                                         for term in whole_windows_terms if term.strip())
+        self.last_window_masks = ()
+        self.last_private_window_ids = ()
         self.mode = mode
         self.terms = tuple(_fold(term.strip()) for term in terms if term.strip())
         self.regions = []
@@ -122,9 +145,31 @@ class Redactor:
             # Do not propagate provider error text, which can contain OCR data.
             raise RuntimeError("Local text recognition failed") from None
 
-    def redact(self, image):
+    def redact(self, image, windows=()):
         if not isinstance(image, Image.Image) or image.width < 1 or image.height < 1:
             raise ValueError("Invalid captured frame")
+        # Native window bounds are pixels and may extend offscreen. Validate
+        # before recognition; draw only their intersection with this frame.
+        window_rects = []
+        window_ids = []
+        if not isinstance(windows, (tuple, list)):
+            raise ValueError("Invalid window metadata")
+        for window in windows:
+            if (not isinstance(window, dict)
+                    or set(window) not in ({"x", "y", "w", "h"}, {"x", "y", "w", "h", "id"})):
+                raise ValueError("Invalid window metadata")
+            window_id = window.get("id")
+            if "id" in window and (isinstance(window_id, bool) or not isinstance(window_id, int) or window_id < 0):
+                raise ValueError("Invalid window metadata")
+            x, y, w, h = (window[key] for key in ("x", "y", "w", "h"))
+            if (any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                    for v in (x, y, w, h)) or w <= 0 or h <= 0
+                    or not math.isfinite(x + w) or not math.isfinite(y + h)):
+                raise ValueError("Invalid window metadata")
+            window_rects.append((x, y, x + w, y + h))
+            window_ids.append(window_id)
+        whole_window_regions = set()
+        private_window_ids = set()
         try:
             data = self._ocr(image)
             lines = {}
@@ -147,29 +192,86 @@ class Redactor:
             rows.sort(key=lambda row: (row[1][1], row[1][0]))
             selected = set(range(len(rows))) if self.mode == "protective" else set()
             folded = [_fold(row[0]) for row in rows]
+            owners, groups = [], {}
+            for i, (_, rect) in enumerate(rows):
+                midpoint = ((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
+                owner = next((j + 1 for j, window in enumerate(window_rects)
+                              if window[0] <= midpoint[0] < window[2]
+                              and window[1] <= midpoint[1] < window[3]), 0)
+                owners.append(owner)
+                groups.setdefault(owner, []).append(i)
+            if window_rects:
+                for i, (_, rect) in enumerate(rows):
+                    if not (any(term.search(folded[i]) for term in self.whole_windows_terms)
+                            or FIELD.fullmatch(folded[i]) and WHOLE_SECRET_FIELD.search(folded[i])):
+                        continue
+                    if not owners[i]:
+                        # Menu-bar scope text has no reliable content window.
+                        selected.add(i)
+                        continue
+                    # Metadata is frontmost first; obscured background windows
+                    # cannot own visible text merely because they are smaller.
+                    j = owners[i] - 1
+                    region = window_rects[j]
+                    if window_ids[j] is not None:
+                        private_window_ids.add(window_ids[j])
+                    whole_window_regions.add((max(0, math.floor(region[0])), max(0, math.floor(region[1])),
+                                              min(image.width, math.ceil(region[2])),
+                                              min(image.height, math.ceil(region[3]))))
             if self.mode == "selective":
+                positions = {i: position for indices in groups.values()
+                             for position, i in enumerate(indices)}
                 for i, (text, _) in enumerate(rows):
-                    if (any(pattern.search(folded[i]) for pattern in PATTERNS)
-                            or PERSON.search(text) or UPPER_PERSON.search(text)):
+                    if (any(pattern.search(text) for pattern in PATTERNS)
+                            or SECRET_ASSIGNMENT.search(text) or SECRET_ENV.search(text) or BASE58_KEY.search(text)
+                            or FIELD.fullmatch(folded[i])):
                         selected.add(i)
                     # Labels and their immediately following value are often separate OCR lines.
-                    if FIELD.search(folded[i]) and i + 1 < len(rows):
+                    following_indices = groups[owners[i]][positions[i] + 1:]
+                    if FIELD.fullmatch(folded[i]) and following_indices:
+                        j = following_indices[0]
                         label = rows[i][1]
-                        following = rows[i + 1][1]
-                        if 0 <= following[1] - label[3] <= max(80, (label[3] - label[1]) * 4):
-                            selected.add(i + 1)
-            combined, spans = "", []
-            for text in folded:
-                start = len(combined)
-                combined += text + " "
-                spans.append((start, start + len(text)))
-            for term in self.terms:
-                offset = 0
-                while (match := combined.find(term, offset)) >= 0:
-                    end = match + len(term)
-                    selected.update(i for i, (start, stop) in enumerate(spans)
-                                    if start < end and stop > match)
-                    offset = match + 1
+                        following = rows[j][1]
+                        # An inline value already belongs to the label's row.
+                        if (not re.search(r"[=:：]\s*\S", text)
+                                and (window_rects or _nearby(label, following))):
+                            selected.add(j)
+                    # PEM bodies and wrapped recovery phrases need context even
+                    # when a short fragment has no standalone secret signature.
+                    if PEM_BEGIN.search(text) or SEED_FIELD.fullmatch(folded[i]):
+                        previous = rows[i][1]
+                        for distance, j in enumerate(following_indices, 1):
+                            candidate, rect = rows[j]
+                            if not window_rects and not _nearby(previous, rect):
+                                break
+                            if PEM_BEGIN.search(text):
+                                body = candidate.strip()
+                                if not (PEM_END.search(candidate)
+                                        or (re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", body)
+                                            and (len(body) >= 16 or body.endswith("=")))):
+                                    break
+                            else:
+                                words = re.findall(r"\b[a-z]+\b", _fold(candidate))
+                                if (distance > 4 or not 3 <= len(words) <= 24
+                                        or not re.fullmatch(r"[a-z]+(?:[\s,]+[a-z]+)*", candidate)
+                                        or FIELD.fullmatch(_fold(candidate))):
+                                    break
+                            selected.add(j)
+                            previous = rect
+                            if PEM_END.search(candidate):
+                                break
+            for indices in groups.values():
+                combined, spans = "", []
+                for i in indices:
+                    start = len(combined)
+                    combined += folded[i] + " "
+                    spans.append((i, start, start + len(folded[i])))
+                for term in self.terms:
+                    offset = 0
+                    while (match := combined.find(term, offset)) >= 0:
+                        end = match + len(term)
+                        selected.update(i for i, start, stop in spans if start < end and stop > match)
+                        offset = match + 1
         except Exception:
             raise RuntimeError("Local redaction failed") from None
 
@@ -185,5 +287,11 @@ class Redactor:
             draw.rectangle((math.floor(x * image.width), math.floor(y * image.height),
                             min(image.width - 1, math.ceil((x + w) * image.width)),
                             min(image.height - 1, math.ceil((y + h) * image.height))), fill="black")
+        for x1, y1, x2, y2 in whole_window_regions:
+            draw.rectangle((x1, y1, x2 - 1, y2 - 1), fill="black")
+        self.last_window_masks = tuple({"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
+                                       for x1, y1, x2, y2 in sorted(whole_window_regions))
+        self.last_private_window_ids = tuple(sorted(private_window_ids))
         return safe, {"recognized_lines": len(rows), "masked_lines": len(selected),
-                      "manual_regions": len(self.regions)}
+                      "manual_regions": len(self.regions),
+                      "whole_window_regions": len(whole_window_regions)}

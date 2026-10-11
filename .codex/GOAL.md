@@ -1,5 +1,27 @@
 # Safestream: private desktop, redacted OBS output
 
+Current request, superseding initial defaults (2026-10-11): use selective privacy
+on the real screen, preserve ordinary public text, and track moving Telegram,
+Challenger, Instagram, Gmail, LastPass and 1Password windows. Hide personal names,
+addresses, cards, handles, email, password/2FA fields and private/public/API keys.
+The same original Safestream runtime and OBS scene remain owned by this chat.
+No messages, sign-in, credential reads or broadcasts are authorized by this task.
+
+Current operator canary: move an actual Telegram window and a harmless public
+test window on the selected display; compare each processed OBS frame with the
+current privacy rectangles and verify ordinary settled public text is readable.
+Done means selective mode is live, tracked private windows stay opaque during
+movement, new pixels wait for classification, tested synthetic secret categories
+are covered, OBS readback passes, and the capture cadence is measured truthfully.
+Unread or failed classification must block new pixels, never reuse masks at old
+coordinates. Unknown private facts and arbitrary secret strings remain a stated
+recognition limit; explicit private terms/whole-window rules cover known surfaces.
+
+Current slices cut before implementation: (1) selective secret recognition and
+regressions, (2) persistent native capture with private window masks, (3) exact
+changed-region quarantine and output integration, (4) launcher/policy and live
+moving-window proof. Helpers mutate disjoint files, root integrates and verifies.
+
 Working target: Resume twentyone2x/safestream on this Mac, preserving the
 user's native view while OBS receives only locally processed, redacted frames.
 Operator path: Launch Safestream, capture the chosen display privately, redact
