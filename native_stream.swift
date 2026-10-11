@@ -1,6 +1,7 @@
 import Foundation
+import Darwin
 import AppKit
-import ScreenCaptureKit
+@preconcurrency import ScreenCaptureKit
 import CoreGraphics
 import CoreMedia
 import ImageIO
@@ -34,6 +35,36 @@ private struct Snapshot {
     var scanMS: Double = 0
     var masks: [CGRect] = []
     var excludedIDs: [Int] = []
+    var pids: [Int: Int] = [:]
+    var foreground: [Int: [CGRect]] = [:]
+}
+
+private func exclusionIsBound(applied: Double?, source: Double, matches: Bool) -> Bool {
+    guard let applied else { return false }
+    return applied.isFinite && source.isFinite && source >= applied && matches
+}
+
+private struct FilterReceipt: @unchecked Sendable {
+    let filter: SCContentFilter
+    let applied: Double
+    let ids: Set<Int>
+    let appPIDs: Set<Int>
+    func excludes(_ id: Int, pid: Int, source: Double) -> Bool {
+        exclusionIsBound(applied: applied, source: source, matches: ids.contains(id) || appPIDs.contains(pid))
+    }
+}
+
+private func controlIDs(_ data: Data) -> Set<Int>? {
+    guard data.count <= 65536,
+          let array = try? JSONSerialization.jsonObject(with: data) as? [Any], array.count <= 4096 else { return nil }
+    var ids: Set<Int> = []
+    for value in array {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, number.doubleValue > 0,
+              number.doubleValue <= Double(UInt32.max), number.doubleValue.rounded() == number.doubleValue else { return nil }
+        ids.insert(number.intValue)
+    }
+    return ids
 }
 
 // An idle compositor event refreshes proof only for the exact cached pixel subject.
@@ -145,8 +176,13 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
     let policy: Policy
     let display: CGRect
     let raw: Bool
-    let filter: SCContentFilter
+    var filter: SCContentFilter
     let excludedAppPIDs: Set<Int>
+    var receipts: [FilterReceipt] = []
+    var stickyIDs: Set<Int> = [] // metadataQueue owner; controls are monotonic.
+    var filterTimer: DispatchSourceTimer?
+    var filterInFlight = false
+    var filterRequestedIDs: Set<Int> = []
     let quietStreamForTest = ProcessInfo.processInfo.environment["SAFESTREAM_NATIVE_TEST_QUIET_STREAM"] == "1"
     let queue = DispatchQueue(label: "safestream.native.frames")
     let metadataQueue = DispatchQueue(label: "safestream.native.metadata")
@@ -166,10 +202,12 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
     var identityDigest: Data?
     var lastImage: CGImage?
     var lastImageCapture: Double?
+    var lastImageFilterApplied: Double?
     var lastImageBinding: Snapshot?
     init(policy: Policy, display: CGRect, filter: SCContentFilter, excludedAppPIDs: Set<Int>, raw: Bool = false) {
         self.policy = policy; self.display = display; self.filter = filter; self.raw = raw
         self.excludedAppPIDs = excludedAppPIDs
+        self.receipts = [FilterReceipt(filter: filter, applied: 0, ids: [], appPIDs: excludedAppPIDs)]
     }
 
     func snapshot() -> Snapshot {
@@ -178,8 +216,8 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             return Snapshot(time: ProcessInfo.processInfo.systemUptime, windows: [:], valid: false, epoch: epoch, geometryEpoch: geometryEpoch, visible: [])
         }
         var masks: [Int: CGRect] = [:]
-        var visibleMasks: [CGRect] = []
-        var excludedIDs: [Int] = []
+        var pids: [Int: Int] = [:]
+        var foreground: [Int: [CGRect]] = [:]
         var opaqueForeground: [CGRect] = []
         var seenPIDs: Set<Int> = []
         var all: [Int: CGRect] = [:]
@@ -201,7 +239,7 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             }
             let bundle = bundles[pid]?.bundle ?? ""
             // An unavailable title cannot establish that a window is public.
-            let sensitive = policy.privateApp(owner, bundle) || title == nil || policy.titles.contains {
+            let sensitive = stickyIDs.contains(number) || policy.privateApp(owner, bundle) || title == nil || policy.titles.contains {
                 !$0.isEmpty && (title ?? "").lowercased().contains($0)
             }
             if rect.intersects(display) {
@@ -213,11 +251,9 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             }
             if sensitive && rect.intersects(display) {
                 masks[number] = rect
-                // Alpha does not prove per-pixel opacity; require compositor exclusion.
-                visibleMasks.append(contentsOf: privateMasks(rect, foreground: opaqueForeground,
-                                                             excluded: excludedAppPIDs.contains(pid)))
+                pids[number] = pid
+                foreground[number] = opaqueForeground
             }
-            if excludedAppPIDs.contains(pid) && rect.intersects(display) { excludedIDs.append(number) }
             if (row[kCGWindowAlpha as String] as? Double ?? 0) >= 0.999,
                (row[kCGWindowLayer as String] as? Int) == 0 {
                 opaqueForeground.append(rect)
@@ -231,8 +267,8 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         topology = all; sensitiveIDs = Set(masks.keys)
         var result = Snapshot(time: ProcessInfo.processInfo.systemUptime, windows: masks, valid: true, epoch: epoch, geometryEpoch: geometryEpoch, visible: visible)
         result.scanMS = (result.time - scanStart) * 1000
-        result.masks = visibleMasks
-        result.excludedIDs = excludedIDs.sorted()
+        result.masks = masks.values.map { $0.insetBy(dx: -24, dy: -24) }
+        result.pids = pids; result.foreground = foreground
         return result
     }
 
@@ -268,7 +304,8 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             history.append(after)
             return (after, previous)
         }
-        let idleBound = idleReuseIsBound(lastImageBinding, after)
+        let idleBound = idleReuseIsBound(lastImageBinding, after) &&
+            lastImageFilterApplied == receipts.last?.applied
         let timestamp = idle ? (idleBound ? after.time : (lastImageCapture ?? after.time)) :
             sourceTime
         var current: CGImage?
@@ -283,9 +320,10 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
     }
 
     func emitImage(_ cg: CGImage, timestamp: Double, after: Snapshot, sampledHistory: [Snapshot],
-                   idle: Bool = false, heartbeat: Bool = false, started: Double? = nil) {
+                   idle: Bool = false, heartbeat: Bool = false, started: Double? = nil, receipt: FilterReceipt? = nil) {
         guard cg.width == Int(display.width), cg.height == Int(display.height) else { return }
-        let idleBound = idleReuseIsBound(lastImageBinding, after)
+        let idleBound = idleReuseIsBound(lastImageBinding, after) &&
+            lastImageFilterApplied == receipts.last?.applied
         let before = sampledHistory.last { $0.time <= timestamp }
         let relevant = sampledHistory.filter { $0.time >= (before?.time ?? after.time) } + [after]
         var united: [Int: CGRect] = [:]
@@ -301,18 +339,97 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             lastImage = cg
             lastCapturedPrivateWindows = after.windows
             lastImageCapture = timestamp
+            lastImageFilterApplied = (receipt ?? receipts.last { $0.applied <= timestamp })?.applied
             // Metadata must cover an unchanged geometry/identity at the source time.
             lastImageBinding = !closed && before?.epoch == after.epoch &&
                 before?.geometryEpoch == after.geometryEpoch ? after : nil
         }
         let frame = CGRect(x: 0, y: 0, width: display.width, height: display.height)
-        let masks = closed ? [frame] : relevant.flatMap { $0.masks }.compactMap { rect -> CGRect? in
+        // Bind clipping permissions to the actual source, never the latest update.
+        let proof = receipt ?? receipts.last { $0.applied <= timestamp }
+        let excluded = after.windows.keys.filter {
+            proof?.excludes($0, pid: after.pids[$0] ?? -1, source: timestamp) == true
+        }.sorted()
+        let masks = closed ? [frame] : relevant.flatMap { state in
+            state.windows.flatMap { id, rect in
+                privateMasks(rect, foreground: state.foreground[id] ?? [],
+                    excluded: proof?.excludes(id, pid: state.pids[id] ?? -1, source: timestamp) == true)
+            }
+        }.compactMap { rect -> CGRect? in
             let local = rect.offsetBy(dx: -display.minX, dy: -display.minY).integral.intersection(frame)
             return local.isNull || local.isEmpty ? nil : local
         }
         sequence += 1
         publish(cg, masks: masks, capture: timestamp.isFinite ? timestamp : after.time,
-                sequence: sequence, closed: closed, transition: transition, age: age, epoch: after.epoch, idle: idle, windows: after.visible, scanMS: after.scanMS, raw: raw, heartbeat: heartbeat, started: started, excludedIDs: after.excludedIDs)
+                sequence: sequence, closed: closed, transition: transition, age: age, epoch: after.epoch, idle: idle, windows: after.visible, scanMS: after.scanMS, raw: raw, heartbeat: heartbeat, started: started, excludedIDs: closed ? [] : excluded)
+    }
+
+    func startControls(stream: SCStream, selectedDisplay: SCDisplay) {
+        // A bounded, numeric-only channel. Malformed controls retain every mask.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var line = Data(); var oversized = false
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while true {
+                let count = Darwin.read(STDIN_FILENO, &buffer, buffer.count)
+                if count <= 0 { break }
+                for byte in buffer.prefix(count) {
+                    if byte == 10 {
+                        if !oversized, let ids = controlIDs(line), let self {
+                            self.queue.async {
+                                let admitted = self.metadataQueue.sync { () -> Bool in
+                                    let union = self.stickyIDs.union(ids)
+                                    guard union.count <= 4096 else { return false }
+                                    self.stickyIDs = union; return true
+                                }
+                                guard admitted else {
+                                    FileHandle.standardError.write(Data("Local capture control refused\n".utf8)); return
+                                }
+                                self.refreshFilter(stream: stream, selectedDisplay: selectedDisplay, force: true)
+                            }
+                        } else { FileHandle.standardError.write(Data("Local capture control refused\n".utf8)) }
+                        line.removeAll(keepingCapacity: true); oversized = false
+                    } else if line.count < 65536 { line.append(byte) }
+                    else { oversized = true }
+                }
+            }
+        }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(500))
+        timer.setEventHandler { [weak self] in self?.refreshFilter(stream: stream, selectedDisplay: selectedDisplay) }
+        filterTimer = timer; timer.resume()
+    }
+
+    func refreshFilter(stream: SCStream, selectedDisplay: SCDisplay, force: Bool = false) {
+        guard !filterInFlight else { return }
+        let wanted = metadataQueue.sync {
+            let visible = Set(history.last?.visible.compactMap { $0["id"] } ?? [])
+            return Set(history.last?.windows.keys.map { $0 } ?? []).union(stickyIDs.intersection(visible))
+        }
+        guard force || wanted != filterRequestedIDs else { return }
+        filterInFlight = true
+        Task { @MainActor in
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                let excluded = content.windows.filter { window in
+                    wanted.contains(Int(window.windowID)) || self.policy.privateApp(
+                        window.owningApplication?.applicationName ?? "", window.owningApplication?.bundleIdentifier ?? "") ||
+                        self.policy.titles.contains { !$0.isEmpty && (window.title ?? "").lowercased().contains($0) }
+                }
+                let next = SCContentFilter(display: selectedDisplay, excludingWindows: excluded)
+                try await stream.updateContentFilter(next)
+                // A source older than this successful application has no permission.
+                let applied = ProcessInfo.processInfo.systemUptime
+                let ids = Set(excluded.map { Int($0.windowID) })
+                self.queue.async {
+                    self.filter = next
+                    self.receipts.append(FilterReceipt(filter: next, applied: applied, ids: ids, appPIDs: []))
+                    let cutoff = ProcessInfo.processInfo.systemUptime - 3
+                    while self.receipts.count > 2 && self.receipts[1].applied < cutoff { self.receipts.removeFirst() }
+                    self.filterRequestedIDs = wanted.intersection(ids)
+                    self.filterInFlight = false
+                }
+            } catch { self.queue.async { self.filterInFlight = false } }
+        }
     }
 
     func startHeartbeat() {
@@ -332,12 +449,13 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
                   moved || now - self.lastCompleteAt >= 0.5 else { return }
             self.heartbeatInFlight = true
             self.lastHeartbeatAt = ProcessInfo.processInfo.systemUptime
+            let receipt = self.receipts.last!
             Task { @MainActor in
                 // Read metadata BEFORE the real screenshot; never re-date a cached image.
                 let before = self.metadataQueue.sync { self.snapshot() }
                 let started = ProcessInfo.processInfo.systemUptime
                 do {
-                    let sample = try await screenshotSample(filter: self.filter, configuration: configuration).value
+                    let sample = try await screenshotSample(filter: receipt.filter, configuration: configuration).value
                     let source = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
                     guard sample.isValid, CMSampleBufferDataIsReady(sample), CMSampleBufferGetNumSamples(sample) == 1,
                           source.isFinite, source >= started,
@@ -363,7 +481,7 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
                         // A newer streamed frame already satisfies this capture interval.
                         guard self.lastCompleteAt <= started else { return }
                         self.emitImage(image, timestamp: source, after: after,
-                                       sampledHistory: history, heartbeat: true, started: started)
+                                       sampledHistory: history, heartbeat: true, started: started, receipt: receipt)
                     }
                 } catch {
                     // Failed requests export only a fully masked slate and a numeric code.
@@ -392,6 +510,16 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
 struct NativeStream {
     static func main() async {
         let args = CommandLine.arguments
+        if args.count == 2 && args[1] == "--self-test-control" {
+            let data = FileHandle.standardInput.readDataToEndOfFile()
+            guard let ids = controlIDs(data), let json = try? JSONSerialization.data(withJSONObject: ids.sorted()) else { fail() }
+            FileHandle.standardOutput.write(json); return
+        }
+        if args.count == 3 && args[1] == "--self-test-receipt" {
+            let value = exclusionIsBound(applied: args[2] == "missing" ? nil : 20,
+                source: args[2] == "old" ? 19 : 21, matches: args[2] != "unmatched")
+            FileHandle.standardOutput.write(Data((value ? "true" : "false").utf8)); return
+        }
         let idleTest = args.count == 3 && args[1] == "--self-test-idle" && ["same", "geometry", "identity", "missing"].contains(args[2])
         let rawTest = args.count == 2 && args[1] == "--self-test-raw"
         let occlusionTest = args.count == 3 && args[1] == "--self-test-occlusion" && ["opaque", "transparent", "unexcluded"].contains(args[2])
@@ -453,7 +581,7 @@ struct NativeStream {
             let stream = SCStream(filter: filter, configuration: config, delegate: capture)
             try stream.addStreamOutput(capture, type: .screen, sampleHandlerQueue: capture.queue)
             try await stream.startCapture()
-            capture.queue.async { capture.startHeartbeat() }
+            capture.queue.async { capture.startHeartbeat(); capture.startControls(stream: stream, selectedDisplay: display) }
             // Retain the stream and callback owner for the entire worker lifetime.
             while true {
                 try await Task.sleep(nanoseconds: 1_000_000_000)

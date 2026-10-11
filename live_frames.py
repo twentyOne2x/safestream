@@ -14,6 +14,10 @@ from PIL import Image, ImageDraw
 from geometry import visible_private_regions
 
 
+class StaleFrame(ValueError):
+    """A fully drained packet whose old pixels must never be published."""
+
+
 def rectangles(values, size, allow_id=False):
     if not isinstance(values, list) or len(values) > 4096:
         raise ValueError("Invalid capture geometry")
@@ -181,9 +185,10 @@ def read_packet(pipe, size):
         raise ValueError("Capture display differs")
     captured = metadata.get("capture_monotonic")
     if (type(captured) not in (int, float) or not math.isfinite(captured)
-            or captured > time.monotonic()+0.1 or captured < 0
-            or (metadata.get("fail_closed") is not True and time.monotonic()-captured > 3)):
+            or captured > time.monotonic()+0.1 or captured < 0):
         raise ValueError("Capture is not fresh")
+    if metadata.get("fail_closed") is not True and time.monotonic()-captured > 3:
+        raise StaleFrame("Capture is not fresh")
     excluded = metadata.get("excluded_window_ids", [])
     if not isinstance(excluded, list) or len(excluded) > 4096 or any(type(i) is not int or i <= 0 for i in excluded):
         raise ValueError("Invalid exclusion receipt")
@@ -211,7 +216,8 @@ def run_live(frames, redactor, display, stop, fps, root, policy_path, pause_path
     command = [str(root/".build/native-stream"),
                *(str(display[k]) for k in ("left", "top", "width", "height")),
                str(policy_path), str(int(fps)), "--raw"]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, bufsize=0)
     gate = PixelGate(size, redactor)
     condition = threading.Condition()
     latest, failure = [None], [False]
@@ -219,7 +225,15 @@ def run_live(frames, redactor, display, stop, fps, root, policy_path, pause_path
     def reader():
         try:
             while not stop.is_set():
-                packet = read_packet(process.stdout, size)
+                try:
+                    packet = read_packet(process.stdout, size)
+                except StaleFrame:
+                    # Refuse the old image while draining this same worker's
+                    # backlog. Recovery still needs a fresh, certified packet.
+                    with condition:
+                        latest[0] = None
+                    frames.pause("capture-unavailable")
+                    continue
                 with condition:
                     latest[0] = packet
                     condition.notify_all()
@@ -239,6 +253,7 @@ def run_live(frames, redactor, display, stop, fps, root, policy_path, pause_path
 
     def scanner():
         previous = None
+        sent_ids = set()
         while not stop.is_set():
             with condition:
                 condition.wait(timeout=0.1)
@@ -253,6 +268,22 @@ def run_live(frames, redactor, display, stop, fps, root, policy_path, pause_path
                 continue
             try:
                 gate.certify(image, meta["windows"], meta.get("scene_epoch", 0), meta["excluded_window_ids"])
+                with gate.lock:
+                    private_ids = set(gate.private_ids)
+                if private_ids != sent_ids:
+                    if len(private_ids) > 4096 or any(type(i) is not int or i <= 0 for i in private_ids):
+                        raise ValueError("Invalid private window identity")
+                    # Numeric identities only. Masks remain until a later capture
+                    # carries the native compositor's applied exclusion receipt.
+                    message = (json.dumps(sorted(private_ids), separators=(",", ":"))+"\n").encode()
+                    remaining = memoryview(message)
+                    while remaining:
+                        written = process.stdin.write(remaining)
+                        if not written:
+                            raise EOFError("Local capture control ended")
+                        remaining = remaining[written:]
+                    process.stdin.flush()
+                    sent_ids = private_ids
                 previous = identity
             except Exception:
                 frames.pause("processing-failed")
@@ -291,4 +322,5 @@ def run_live(frames, redactor, display, stop, fps, root, policy_path, pause_path
             process.kill()
             process.wait(timeout=3)
         process.stdout.close()
+        process.stdin.close()
         frames.pause("stopped")

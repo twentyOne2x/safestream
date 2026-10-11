@@ -1,6 +1,7 @@
 import json
 import os
-import select
+import queue
+import threading
 import struct
 import subprocess
 import time
@@ -103,7 +104,8 @@ def test_private_geometry_clips_only_with_compositor_exclusion_receipt(opacity):
 
 @pytest.mark.skipif(os.environ.get("SAFESTREAM_NATIVE_LIVE_TEST") != "1",
                     reason="Explicit local synthetic-window capture check")
-def test_live_synthetic_private_window_is_dark(tmp_path):
+@pytest.mark.parametrize("classification", ["title", "control"])
+def test_live_synthetic_private_window_is_dark(tmp_path, classification):
     import mss
 
     # Only this harmless test app is opened; no existing application is touched.
@@ -131,54 +133,103 @@ app.run()
             monitor = screens.monitors[1]
         policy = tmp_path / "policy.json"
         policy.write_text(json.dumps({"private_apps": [],
-            "private_titles": ["SAFESTREAM SYNTHETIC PRIVATE TEST"]}))
+            "private_titles": ["SAFESTREAM SYNTHETIC PRIVATE TEST"] if classification == "title" else []}))
         capture = subprocess.Popen([str(HELPER), str(monitor["left"]),
             str(monitor["top"]), str(monitor["width"]), str(monitor["height"]),
-            str(policy), "15", "--raw"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            str(policy), "15", "--raw"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE,
             env=dict(os.environ, SAFESTREAM_NATIVE_TEST_QUIET_STREAM="1"))
-        received = b""
+        packets = queue.Queue(maxsize=4)
+        def read_exact(length):
+            result = bytearray()
+            while len(result) < length:
+                chunk = capture.stdout.read(length - len(result))
+                if not chunk:
+                    raise EOFError("Local capture ended")
+                result.extend(chunk)
+            return bytes(result)
+        def reader():
+            try:
+                while True:
+                    header = read_exact(4)
+                    length = struct.unpack(">I", header)[0]
+                    assert 2 <= length <= 1_000_000
+                    metadata_bytes = read_exact(length)
+                    image_header = read_exact(4)
+                    image_length = struct.unpack(">I", image_header)[0]
+                    assert 8 <= image_length <= monitor["width"] * monitor["height"] * 8
+                    packets.put(header + metadata_bytes + image_header + read_exact(image_length))
+            except Exception as error:
+                packets.put(error)
+        threading.Thread(target=reader, daemon=True).start()
         deadline = time.monotonic() + 25
         passed = False
         last_metadata = None
         healthy = []
+        controlled_id = None
         while time.monotonic() < deadline:
-            if not select.select([capture.stdout], [], [], 0.2)[0]:
+            try:
+                packet = packets.get(timeout=0.2)
+            except queue.Empty:
                 continue
-            received += os.read(capture.stdout.fileno(), 1024 * 1024)
-            while len(received) >= 4:
-                size = struct.unpack(">I", received[:4])[0]
-                if len(received) < size + 8:
+            if isinstance(packet, Exception):
+                raise packet
+            metadata, image = frame(packet)
+            last_metadata = metadata
+            assert metadata["capture_error_code"] == 0, metadata["capture_error_code"]
+            # Primary display origin and AppKit bottom-left coordinates.
+            point = (150, monitor["height"] - 150)
+            if not metadata["fail_closed"]:
+                if classification == "control":
+                    if controlled_id is None:
+                        candidates = [r for r in metadata["windows"] if r["x"] <= point[0] < r["x"] + r["w"] and
+                                      r["y"] <= point[1] < r["y"] + r["h"]]
+                        controlled_id = min(candidates, key=lambda r: r["w"] * r["h"])["id"]
+                        capture.stdin.write((json.dumps([controlled_id]) + "\n[false]\n[]\n").encode())
+                        capture.stdin.flush()
+                        continue
+                    if controlled_id not in metadata["excluded_window_ids"]:
+                        continue  # Whole-window guards remain until a source-bound SDK receipt.
+                assert any(r["x"] <= point[0] < r["x"] + r["w"] and
+                           r["y"] <= point[1] < r["y"] + r["h"] for r in metadata["masks"])
+                assert image.getpixel(point) == (14, 17, 20)
+                assert "SAFESTREAM SYNTHETIC" not in json.dumps(metadata)
+                assert metadata["screenshot_heartbeat"]  # Actual SDK backstop.
+                assert not metadata["idle_replay"]
+                assert metadata["capture_started_monotonic"] <= metadata["capture_monotonic"] <= metadata["emitted_monotonic"]
+                assert metadata["emitted_monotonic"] - metadata["capture_monotonic"] <= 0.5
+                assert time.monotonic() - metadata["capture_monotonic"] <= 1.0
+                healthy.append(metadata)
+                passed = len(healthy) >= 12 and healthy[-1]["capture_monotonic"] - healthy[0]["capture_monotonic"] >= 2
+                if passed:
                     break
-                png_size = struct.unpack(">I", received[size + 4:size + 8])[0]
-                total = size + 8 + png_size
-                if len(received) < total:
-                    break
-                metadata, image = frame(received[:total])
-                last_metadata = metadata
-                assert metadata["capture_error_code"] == 0, metadata["capture_error_code"]
-                received = received[total:]
-                # Primary display origin and AppKit bottom-left coordinates.
-                point = (150, monitor["height"] - 150)
-                if not metadata["fail_closed"]:
-                    assert any(r["x"] <= point[0] < r["x"] + r["w"] and
-                               r["y"] <= point[1] < r["y"] + r["h"]
-                               for r in metadata["masks"])
-                    assert image.getpixel(point) == (14, 17, 20)
-                    assert "SAFESTREAM SYNTHETIC" not in json.dumps(metadata)
-                    healthy.append(metadata)
-                    assert metadata["screenshot_heartbeat"]  # Real SDK backstop, not streaming fixtures.
-                    if metadata["screenshot_heartbeat"]:
-                        assert not metadata["idle_replay"]
-                        assert metadata["capture_started_monotonic"] <= metadata["capture_monotonic"] <= metadata["emitted_monotonic"]
-                        assert metadata["emitted_monotonic"] - metadata["capture_monotonic"] <= 0.5
-                    passed = len(healthy) >= 12 and (healthy[-1]["capture_monotonic"] - healthy[0]["capture_monotonic"] >= 2)
-                    if passed:
-                        break
-            if passed:
-                break
         assert passed, ("No healthy masked synthetic frame arrived", capture.poll(), len(healthy), json.dumps({k: v for k, v in (last_metadata or {}).items() if k not in ("masks", "windows")}))
     finally:
         for process in (capture, window):
             if process is not None:
                 process.terminate()
                 process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("value", [[], [1, 2, 2], [4294967295]])
+def test_numeric_control_accepts_bounded_positive_ids(value):
+    result = subprocess.run([str(HELPER), "--self-test-control"], input=json.dumps(value).encode(),
+                            capture_output=True, check=True, timeout=5)
+    assert json.loads(result.stdout) == sorted(set(value))
+    assert result.stderr == b""
+
+
+@pytest.mark.parametrize("value", [[0], [-1], [True], [1.5], [4294967296], [1] * 4097,
+                                  {"private": 1}, "PRIVATE SENTINEL"])
+def test_numeric_control_refuses_malformed_values_generically(value):
+    result = subprocess.run([str(HELPER), "--self-test-control"], input=json.dumps(value).encode(),
+                            capture_output=True, timeout=5)
+    assert result.returncode != 0
+    assert result.stdout == b""
+    assert result.stderr == b"Local display stream failed\n"
+
+
+@pytest.mark.parametrize("case,expected", [("missing", False), ("old", False), ("unmatched", False), ("new", True)])
+def test_exclusion_receipt_requires_matching_id_and_applied_source(case, expected):
+    result = subprocess.run([str(HELPER), "--self-test-receipt", case], capture_output=True, check=True, timeout=5)
+    assert json.loads(result.stdout) is expected
+    assert result.stderr == b""

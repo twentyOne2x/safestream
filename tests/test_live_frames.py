@@ -159,3 +159,46 @@ def test_unexcluded_private_window_cannot_be_unmasked_by_transparent_foreground(
     private = {"id": 1, "x": 0, "y": 0, "w": 300, "h": 300}
     assert visible_private_regions([public, private], {1}) == [
         {"x": 0, "y": 0, "w": 300, "h": 300}]
+
+
+def test_stale_packet_is_refused_then_fresh_capture_resumes_on_same_worker(tmp_path):
+    import threading
+    from live_frames import run_live
+    executable = tmp_path / '.build' / 'native-stream'
+    executable.parent.mkdir()
+    payload = BytesIO()
+    Image.new('RGB', (128, 96), 'white').save(payload, format='PNG')
+    executable.write_text('''#!/usr/bin/env python3
+import json,struct,sys,time
+payload=%r
+for index in range(40):
+ m={'width':128,'height':96,'capture_monotonic':time.monotonic()-(5 if index==0 else 0),
+    'windows':[],'masks':[],'fail_closed':False,'sequence':index}
+ b=json.dumps(m).encode()
+ sys.stdout.buffer.write(struct.pack('>I',len(b))+b+struct.pack('>I',len(payload))+payload)
+ sys.stdout.buffer.flush()
+ time.sleep(.05)
+''' % payload.getvalue())
+    executable.chmod(0o700)
+    class Frames:
+        def __init__(self): self.sources=[]; self.pauses=[]; self.ready=threading.Event()
+        def publish(self, image, captured, counts):
+            self.sources.append(captured)
+            if image.getpixel((60,60)) == (255,255,255): self.ready.set()
+        def pause(self, reason='paused'): self.pauses.append(reason)
+    frames=Frames(); stop=threading.Event(); errors=[]
+    started=time.monotonic()
+    def execute():
+        try: run_live(frames,SyntheticRedactor(),{'left':0,'top':0,'width':128,'height':96},
+                      stop,15,tmp_path,tmp_path/'policy.json',tmp_path/'pause')
+        except Exception as error: errors.append(error)
+    worker=threading.Thread(target=execute)
+    worker.start()
+    try:
+        assert frames.ready.wait(4), 'Same capture worker did not recover'
+    finally:
+        stop.set(); worker.join(timeout=4)
+    assert not worker.is_alive()
+    assert not errors
+    assert 'capture-unavailable' in frames.pauses
+    assert frames.sources and all(source >= started for source in frames.sources)
