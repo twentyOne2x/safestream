@@ -79,7 +79,7 @@ private func fail() -> Never {
     exit(1)
 }
 
-// Preserve only the visible parts of a private window behind opaque foregrounds.
+// Foreground geometry may clip a mask only after compositor exclusion is proved.
 private func subtract(_ rect: CGRect, _ foreground: CGRect) -> [CGRect] {
     let cut = rect.intersection(foreground)
     if cut.isNull || cut.isEmpty { return [rect] }
@@ -218,7 +218,7 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         var masks: [Int: CGRect] = [:]
         var pids: [Int: Int] = [:]
         var foreground: [Int: [CGRect]] = [:]
-        var opaqueForeground: [CGRect] = []
+        var foregroundRects: [CGRect] = []
         var seenPIDs: Set<Int> = []
         var all: [Int: CGRect] = [:]
         var visible: [[String: Int]] = []
@@ -252,11 +252,12 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             if sensitive && rect.intersects(display) {
                 masks[number] = rect
                 pids[number] = pid
-                foreground[number] = opaqueForeground
+                foreground[number] = foregroundRects
             }
-            if (row[kCGWindowAlpha as String] as? Double ?? 0) >= 0.999,
-               (row[kCGWindowLayer as String] as? Int) == 0 {
-                opaqueForeground.append(rect)
+            // Floating/transparent foregrounds are safe here: privateMasks only
+            // clips when that source already excludes the private background.
+            if (row[kCGWindowAlpha as String] as? Double ?? 0) > 0 {
+                foregroundRects.append(rect)
             }
         }
         bundles = bundles.filter { seenPIDs.contains($0.key) }
@@ -407,6 +408,7 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         }
         guard force || wanted != filterRequestedIDs else { return }
         filterInFlight = true
+        let priorReceipt = receipts.last
         Task { @MainActor in
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -415,11 +417,20 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
                         window.owningApplication?.applicationName ?? "", window.owningApplication?.bundleIdentifier ?? "") ||
                         self.policy.titles.contains { !$0.isEmpty && (window.title ?? "").lowercased().contains($0) }
                 }
+                let ids = Set(excluded.map { Int($0.windowID) })
+                // Unshareable CG surfaces must not repeatedly reapply an
+                // identical filter and invalidate otherwise fresh idle frames.
+                if let priorReceipt, priorReceipt.appPIDs.isEmpty, priorReceipt.ids == ids {
+                    self.queue.async {
+                        self.filterRequestedIDs = wanted.intersection(ids)
+                        self.filterInFlight = false
+                    }
+                    return
+                }
                 let next = SCContentFilter(display: selectedDisplay, excludingWindows: excluded)
                 try await stream.updateContentFilter(next)
                 // A source older than this successful application has no permission.
                 let applied = ProcessInfo.processInfo.systemUptime
-                let ids = Set(excluded.map { Int($0.windowID) })
                 self.queue.async {
                     self.filter = next
                     self.receipts.append(FilterReceipt(filter: next, applied: applied, ids: ids, appPIDs: []))

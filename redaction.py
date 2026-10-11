@@ -210,7 +210,8 @@ class Redactor:
             if window_rects:
                 for i, (_, rect) in enumerate(rows):
                     if not (any(term.search(folded[i]) for term in self.whole_windows_terms)
-                            or FIELD.fullmatch(folded[i]) and WHOLE_SECRET_FIELD.search(folded[i])):
+                            or FIELD.fullmatch(folded[i]) and WHOLE_SECRET_FIELD.search(folded[i])
+                            or PEM_BEGIN.search(folded[i]) or PEM_END.search(folded[i])):
                         continue
                     if not owners[i]:
                         # Menu-bar scope text has no reliable content window.

@@ -11,7 +11,7 @@ from collections import OrderedDict
 from io import BytesIO
 
 from PIL import Image, ImageDraw
-from geometry import visible_private_regions
+from geometry import owning_windows, visible_private_regions
 
 
 class StaleFrame(ValueError):
@@ -70,10 +70,13 @@ class PixelGate:
                             math.ceil(w["x"]+w["w"])-1, math.ceil(w["y"]+w["h"])-1), fill="black")
         return result
 
-    def keys(self, image, windows, epoch):
+    def contexts(self, image, windows):
+        return [(w, hashlib.blake2b(image.crop((w["x"],w["y"],w["x"]+w["w"],w["y"]+w["h"])).tobytes(),
+                                   digest_size=20).hexdigest()) for w in windows]
+
+    def keys(self, image, windows, epoch, contexts=None):
         result = []
-        contexts = [(w, hashlib.blake2b(image.crop((w["x"], w["y"], w["x"]+w["w"], w["y"]+w["h"])).tobytes(),
-                                       digest_size=20).hexdigest()) for w in windows]
+        contexts = self.contexts(image, windows) if contexts is None else contexts
         background = hashlib.blake2b(image.tobytes(), digest_size=20).hexdigest()
         for x1, y1, x2, y2 in self.boxes:
             identities = [(w.get("id"), w["x"], w["y"], w["w"], w["h"], fingerprint)
@@ -87,22 +90,27 @@ class PixelGate:
             result.append(digest.digest())
         return result
 
-    def window_keys(self, image, windows, epoch):
+    def window_keys(self, image, windows, epoch, contexts=None):
         result = []
-        for i,w in enumerate(windows):
+        contexts = self.contexts(image, windows) if contexts is None else contexts
+        for i,(w,fingerprint) in enumerate(contexts):
             box = (w["x"],w["y"],w["x"]+w["w"],w["y"]+w["h"])
-            digest = hashlib.blake2b(image.crop(box).tobytes(),digest_size=20)
+            digest = hashlib.blake2b(bytes.fromhex(fingerprint),digest_size=20)
             foreground = [(f.get("id"),f["x"]-w["x"],f["y"]-w["y"],f["w"],f["h"])
                           for f in windows[:i] if f["x"] < box[2] and f["x"]+f["w"] > box[0]
                           and f["y"] < box[3] and f["y"]+f["h"] > box[1]]
-            digest.update(json.dumps([epoch,w.get("id"),w["w"],w["h"],foreground]).encode())
+            # Fixed policy and exact complete pixels/context certify this window
+            # despite unrelated titles elsewhere. Current hard masks still win.
+            digest.update(json.dumps([w.get("id"),w["w"],w["h"],foreground]).encode())
             result.append((digest.digest(),box))
         return result
 
     def certify(self, image, windows, epoch, excluded_ids=()):
         image = self.normalized(image, windows, excluded_ids=excluded_ids)
-        keys = self.keys(image, windows, epoch)
-        window_keys = self.window_keys(image, windows, epoch)
+        windows = owning_windows(windows)
+        contexts = self.contexts(image, windows)
+        keys = self.keys(image, windows, epoch, contexts)
+        window_keys = self.window_keys(image, windows, epoch, contexts)
         started = time.monotonic()
         processed, counts = self.redactor.redact(image, windows=windows)
         if processed.size != self.size:
@@ -125,8 +133,10 @@ class PixelGate:
         if image.size != self.size:
             raise ValueError("Captured frame size changed")
         image = self.normalized(image, windows, masks, excluded_ids)
-        keys = self.keys(image, windows, epoch)
-        window_keys = self.window_keys(image, windows, epoch)
+        owners = owning_windows(windows)
+        contexts = self.contexts(image, owners)
+        keys = self.keys(image, owners, epoch, contexts)
+        window_keys = self.window_keys(image, owners, epoch, contexts)
         safe = Image.new("RGB", self.size, "black")
         pending = 0
         with self.lock:
@@ -158,7 +168,8 @@ class PixelGate:
                             min(self.size[0]-1, math.ceil((x+w) * self.size[0])),
                             min(self.size[1]-1, math.ceil((y+h) * self.size[1]))), fill="black")
         return safe, {**counts, "pending_tiles": pending, "total_tiles": len(self.boxes),
-                      "certified_windows":approved_windows,"pending_windows":len(windows)-approved_windows,
+                      "certified_windows":approved_windows,"pending_windows":len(owners)-approved_windows,
+                      "context_windows":len(owners),"observed_windows":len(windows),
                       "tracked_private_windows": len(hard)}
 
 

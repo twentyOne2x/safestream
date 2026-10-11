@@ -14,13 +14,24 @@ selects the **Safestream** scene. Use that scene when you stream or record. The
 launcher itself never starts a broadcast, recording or virtual camera. Keep its
 Terminal window open; Control-C stops it. OBS then shows **Privacy paused**.
 
-The initial **protective** mode covers every text line OCR recognizes. For a
-more readable stream, create `local-policy.json` from `policy.example.json`, set
-`"mode": "selective"`, and add sensitive names, addresses and private project
-names to `private-terms.txt`, one per line. Keep those details in these local
-files. Both are excluded from Git. Restart the launcher after editing them.
-Selective mode also applies conservative name, address, phone, email, card,
-expiry, security-code and token patterns. It can hide ordinary headings too.
+The default **selective** mode keeps ordinary public text readable. Telegram,
+LastPass, 1Password, Apple Passwords and OBS's own preview are covered as whole
+windows. Browser/window titles matching Challenger, Instagram, Gmail, login,
+password and verification surfaces are also covered. A local text check can
+recognize these scopes inside a generic editor or chat window; that window then
+stays private while it moves or scrolls, including a move to another display.
+Public windows in front remain visible.
+
+Emails, handles, addresses, phone numbers, card details, six-digit codes and
+recognizable private/public/API keys are covered. Recognized password, 2FA and
+recovery fields make their owning window private. Ordinary capitalization does
+not hide a heading. Unknown unlabelled personal names and unusual secret formats
+need your local terms or a whole-window rule.
+
+Add sensitive family names, addresses and private project names to
+`private-terms.txt`, one per line. Copy `policy.example.json` to `local-policy.json`
+to add `private_apps` (owner/bundle substrings) or `private_titles` (title
+substrings). Both local files are excluded from Git. Restart after editing them.
 
 For an area that must always be hidden, add normalized rectangles to the local
 policy, for example `{"x": 0, "y": 0, "w": 0.2, "h": 1}` to cover the left
@@ -33,12 +44,17 @@ are real limits, including in protective mode. Check the redacted preview and
 cover known sensitive areas before sharing. Privacy applies to this visual
 source; other OBS scenes and audio sources retain their own behavior.
 
-Capture and OCR run up to twice a second, depending on screen contents and Mac
-load. This first version is intended for desktop demonstrations, not smooth
-gameplay. Each published frame is processed in full before it becomes visible.
-Frames older than five seconds are replaced by a slate. The browser separately
-blanks its output on server failure, including abrupt process death. No raw
-screen-capture source is added to OBS.
+Continuous capture targets 15 frames per second. Window masks are applied
+before frames leave the native capture helper. Local OCR runs separately: pixels
+in a changed window remain opaque until a matching whole-window context has been
+checked. This can briefly cover public content while it changes; sensitive pixels
+never use a previous mask at a new location. Capture rate and classification delay
+depend on screen contents and Mac load.
+
+The output pauses when capture or recognition cannot qualify new content. Frames
+older than five seconds are replaced by a slate, and the browser independently
+blanks on server failure or abrupt process death. No raw display source is added
+to OBS. Captured pixels, recognized text and private terms stay local.
 
 For the external display, launch with:
 

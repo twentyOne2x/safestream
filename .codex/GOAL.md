@@ -7,7 +7,7 @@ addresses, cards, handles, email, password/2FA fields and private/public/API key
 The same original Safestream runtime and OBS scene remain owned by this chat.
 No messages, sign-in, credential reads or broadcasts are authorized by this task.
 
-Current operator canary: move an actual Telegram window and a harmless public
+Current operator canary: change an actual Telegram window's bounds and move a harmless public
 test window on the selected display; compare each processed OBS frame with the
 current privacy rectangles and verify ordinary settled public text is readable.
 Done means selective mode is live, tracked private windows stay opaque during
@@ -73,3 +73,16 @@ OBS restart, and repeated launcher selection were exercised. No broadcast starte
 An OBS crash occurred during setup/reload; normal-mode recovery retained the scene.
 Routine reuse now avoids unnecessary browser settings/reload calls. First-setup
 ownership is journaled before creation and a retained empty scene can resume.
+
+2026-10-11 selective operator proof: The actual OBS source retained the public
+heading on a harmless native test window while covering its sample name, email,
+handle and card. A native control moved the same window ID 4219 from
+(800,439,460,278) to (960,359,460,278); both OBS readbacks kept the heading visible
+and the four sample categories unreadable. The native window kept its text intact.
+Actual Telegram was brought to its foreground full-screen view and its body region
+was completely opaque in three fresh OBS readbacks; its full-screen/bounds changes
+were exercised and the prior desktop Space restored. No message or draft was edited.
+Public-window processing sampled 56 and 91 milliseconds, capture age 0.245 and
+0.584 seconds, recognition 2.3 and 3.1 seconds on this busy desktop. These samples
+are not a sustained frame-rate claim. Arbitrary unlabelled names, private facts and
+unusual secret formats still need explicit local terms or whole-window protection.

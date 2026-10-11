@@ -8,7 +8,8 @@ if [[ ! -x .build/native-capture || native_capture.swift -nt .build/native-captu
   /usr/bin/swiftc -parse-as-library -O native_capture.swift -o .build/native-capture || exit 1
 fi
 if [[ ! -x .build/native-stream || native_stream.swift -nt .build/native-stream ]]; then
-  /usr/bin/swiftc -parse-as-library -O native_stream.swift -o .build/native-stream || exit 1
+  /usr/bin/swiftc -parse-as-library -O native_stream.swift -o .build/native-stream-launch-next || exit 1
+  mv .build/native-stream-launch-next .build/native-stream || exit 1
 fi
 open -a OBS
 exec .venv/bin/python safestream.py --setup-obs

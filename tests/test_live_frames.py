@@ -202,3 +202,66 @@ for index in range(40):
     assert not errors
     assert 'capture-unavailable' in frames.pauses
     assert frames.sources and all(source >= started for source in frames.sources)
+
+
+def test_public_window_survives_unrelated_epoch_but_current_private_mask_wins():
+    gate = PixelGate((256,256),SyntheticRedactor())
+    windows=[{'id':42,'x':0,'y':0,'w':256,'h':256}]
+    raw=Image.new('RGB',gate.size,'white')
+    gate.certify(raw,windows,1)
+    safe,counts=gate.render(raw,windows,2)
+    assert safe.getpixel((100,100))==(255,255,255)
+    assert counts['pending_tiles']==len(gate.boxes)  # Background/tile scope still expires.
+    mask=[{'x':0,'y':0,'w':256,'h':256}]
+    assert gate.render(raw,windows,2,mask)[0].getpixel((100,100))==(0,0,0)
+    gate.private_ids.add(42)
+    assert gate.render(raw,windows,2)[0].getpixel((100,100))==(0,0,0)
+
+
+def test_context_elimination_preserves_production_ownership_and_all_hard_masks():
+    from unittest.mock import patch
+    from redaction import Redactor
+    from geometry import owning_windows
+    from tests.test_redaction import ocr
+    image=Image.new('RGB',(512,512),'white')
+    # Union coverage, never opacity: two first-containing foreground boxes own
+    # all of window3. Window4 has an uncovered strip and must retain its context.
+    windows=[{'id':1,'x':0,'y':0,'w':256,'h':256},
+             {'id':2,'x':256,'y':0,'w':256,'h':256},
+             {'id':3,'x':0,'y':0,'w':512,'h':256},
+             {'id':4,'x':0,'y':0,'w':512,'h':512}]
+    owners=owning_windows(windows)
+    assert [w['id'] for w in owners]==[1,2,4]
+    rows=ocr(['PUBLIC RELEASE NOTES','alice@example.invalid','Challenger private scope'])
+    rows['left']=[20,280,20];rows['top']=[20,100,350]
+    rows['width']=[200,200,250]
+    redactor=Redactor(mode='selective')
+    with patch.object(redactor,'_ocr',return_value=rows):
+        expected,_=redactor.redact(image,windows=windows)
+        original_ids=redactor.last_private_window_ids
+        compact,_=redactor.redact(image,windows=owners)
+    assert expected.tobytes()==compact.tobytes()
+    assert original_ids==redactor.last_private_window_ids==(4,)
+    gate=PixelGate(image.size,redactor)
+    gate.private_ids.add(3)  # Even an unowned private background remains covered.
+    with patch.object(redactor,'_ocr',return_value=ocr([])):
+        gate.certify(image,windows,1)
+    safe,_=gate.render(image,windows,2)
+    assert safe.getpixel((100,100))==(0,0,0)
+    assert safe.getpixel((300,100))==(0,0,0)
+
+
+def test_pem_window_stays_private_after_header_scrolls_out_of_view():
+    from unittest.mock import patch
+    from redaction import Redactor
+    from tests.test_redaction import ocr
+    gate=PixelGate((512,256),Redactor(mode='selective'))
+    windows=[{'id':8,'x':0,'y':0,'w':256,'h':256}]
+    raw=Image.new('RGB',gate.size,'white')
+    with patch.object(gate.redactor,'_ocr',return_value=ocr(['-----BEGIN PRIVATE KEY-----'])):
+        gate.certify(raw,windows,1)
+    assert gate.private_ids=={8}
+    # An unusual body need not match a token regex after its header disappears.
+    changed=raw.copy();changed.paste('red',(20,40,220,80))
+    moved=[{**windows[0],'x':256}]
+    assert gate.render(changed,moved,2)[0].getpixel((300,50))==(0,0,0)
