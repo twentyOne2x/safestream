@@ -32,13 +32,15 @@ private struct Snapshot {
     let geometryEpoch: Int
     let visible: [[String: Int]]
     var scanMS: Double = 0
+    var masks: [CGRect] = []
+    var excludedIDs: [Int] = []
 }
 
 // An idle compositor event refreshes proof only for the exact cached pixel subject.
 private func idleReuseIsBound(_ original: Snapshot?, _ current: Snapshot) -> Bool {
     guard let original, original.valid, current.valid else { return false }
     return original.epoch == current.epoch && original.geometryEpoch == current.geometryEpoch &&
-        original.windows == current.windows && original.visible == current.visible
+        original.windows == current.windows && original.visible == current.visible && original.masks == current.masks
 }
 
 private func fail() -> Never {
@@ -46,12 +48,56 @@ private func fail() -> Never {
     exit(1)
 }
 
+// Preserve only the visible parts of a private window behind opaque foregrounds.
+private func subtract(_ rect: CGRect, _ foreground: CGRect) -> [CGRect] {
+    let cut = rect.intersection(foreground)
+    if cut.isNull || cut.isEmpty { return [rect] }
+    return [CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: cut.minY - rect.minY),
+        CGRect(x: rect.minX, y: cut.maxY, width: rect.width, height: rect.maxY - cut.maxY),
+        CGRect(x: rect.minX, y: cut.minY, width: cut.minX - rect.minX, height: cut.height),
+        CGRect(x: cut.maxX, y: cut.minY, width: rect.maxX - cut.maxX, height: cut.height)].filter { !$0.isEmpty }
+}
+
+private func privateMasks(_ rect: CGRect, foreground: [CGRect], excluded: Bool) -> [CGRect] {
+    var pieces = [rect.insetBy(dx: -24, dy: -24)]
+    if excluded {
+        for rect in foreground { pieces = pieces.flatMap { subtract($0, rect) } }
+    }
+    return pieces
+}
+
 private func rectangles(_ masks: [CGRect]) -> [[String: Int]] {
     masks.map { ["x": Int($0.minX), "y": Int($0.minY), "w": Int($0.width), "h": Int($0.height)] }
 }
 
+private func image(from buffer: CVPixelBuffer) -> CGImage? {
+    guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA else { return nil }
+    CVPixelBufferLockBaseAddress(buffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+    let bytes = Data(bytes: base, count: CVPixelBufferGetBytesPerRow(buffer) * CVPixelBufferGetHeight(buffer))
+    guard let provider = CGDataProvider(data: bytes as CFData) else { return nil }
+    return CGImage(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer),
+        bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue:
+            CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue),
+        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+}
+
+// The SDK callback transfers a completed, read-only buffer across executors.
+private struct CapturedSample: @unchecked Sendable { let value: CMSampleBuffer }
+@MainActor private func screenshotSample(filter: SCContentFilter, configuration: SCStreamConfiguration) async throws -> CapturedSample {
+    try await withCheckedThrowingContinuation { continuation in
+        SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: configuration) { sample, error in
+            if let error { continuation.resume(throwing: error) }
+            else if let sample { continuation.resume(returning: CapturedSample(value: sample)) }
+            else { continuation.resume(throwing: NSError(domain: "LocalCapture", code: -1)) }
+        }
+    }
+}
+
 private func publish(_ image: CGImage, masks: [CGRect], capture: Double, sequence: Int,
-                     closed: Bool, transition: Bool, age: Double, epoch: Int = 0, idle: Bool = false, windows: [[String: Int]] = [], scanMS: Double = 0, raw: Bool = false) {
+                     closed: Bool, transition: Bool, age: Double, epoch: Int = 0, idle: Bool = false, windows: [[String: Int]] = [], scanMS: Double = 0, raw: Bool = false, heartbeat: Bool = false, errorCode: Int = 0, started: Double? = nil, excludedIDs: [Int] = []) {
     let encodeStart = ProcessInfo.processInfo.systemUptime
     guard let context = CGContext(data: nil, width: image.width, height: image.height,
                                   bitsPerComponent: 8, bytesPerRow: image.width * 4,
@@ -76,10 +122,10 @@ private func publish(_ image: CGImage, masks: [CGRect], capture: Double, sequenc
         guard CGImageDestinationFinalize(destination) else { fail() }
         payload = data as Data
     }
-    let metadata: [String: Any] = ["capture_monotonic": capture, "pixel_format": raw ? "rgbx" : "png", "snapshots_ms": scanMS,
+    let metadata: [String: Any] = ["capture_monotonic": capture, "capture_started_monotonic": started ?? capture, "screenshot_heartbeat": heartbeat, "capture_error_code": errorCode, "pixel_format": raw ? "rgbx" : "png", "snapshots_ms": scanMS,
         "encode_ms": (ProcessInfo.processInfo.systemUptime - encodeStart) * 1000,
         "emitted_monotonic": ProcessInfo.processInfo.systemUptime, "sequence": sequence,
-        "width": image.width, "height": image.height, "masks": rectangles(masks), "windows": windows,
+        "width": image.width, "height": image.height, "excluded_window_ids": excludedIDs, "masks": rectangles(masks), "windows": windows,
         "private_window_count": masks.count, "fail_closed": closed,
         "transition_guard": transition, "scene_epoch": epoch, "idle_replay": idle, "metadata_age_ms": max(0, age * 1000)]
     guard let json = try? JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]) else { fail() }
@@ -94,15 +140,24 @@ private func publish(_ image: CGImage, masks: [CGRect], capture: Double, sequenc
     do { try FileHandle.standardOutput.write(contentsOf: output) } catch { exit(0) }
 }
 
-private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
+private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    // Frame state belongs to queue; metadata state belongs to metadataQueue.
     let policy: Policy
     let display: CGRect
     let raw: Bool
+    let filter: SCContentFilter
+    let excludedAppPIDs: Set<Int>
+    let quietStreamForTest = ProcessInfo.processInfo.environment["SAFESTREAM_NATIVE_TEST_QUIET_STREAM"] == "1"
     let queue = DispatchQueue(label: "safestream.native.frames")
     let metadataQueue = DispatchQueue(label: "safestream.native.metadata")
     var bundles: [Int: (owner: String, bundle: String)] = [:]
     var history: [Snapshot] = []
     var timer: DispatchSourceTimer?
+    var heartbeatTimer: DispatchSourceTimer?
+    var heartbeatInFlight = false
+    var lastCompleteAt = ProcessInfo.processInfo.systemUptime
+    var lastHeartbeatAt: Double = 0
+    var lastCapturedPrivateWindows: [Int: CGRect] = [:]
     var sequence = 0
     var epoch = 0
     var geometryEpoch = 0
@@ -112,7 +167,10 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     var lastImage: CGImage?
     var lastImageCapture: Double?
     var lastImageBinding: Snapshot?
-    init(policy: Policy, display: CGRect, raw: Bool = false) { self.policy = policy; self.display = display; self.raw = raw }
+    init(policy: Policy, display: CGRect, filter: SCContentFilter, excludedAppPIDs: Set<Int>, raw: Bool = false) {
+        self.policy = policy; self.display = display; self.filter = filter; self.raw = raw
+        self.excludedAppPIDs = excludedAppPIDs
+    }
 
     func snapshot() -> Snapshot {
         let scanStart = ProcessInfo.processInfo.systemUptime
@@ -120,6 +178,9 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             return Snapshot(time: ProcessInfo.processInfo.systemUptime, windows: [:], valid: false, epoch: epoch, geometryEpoch: geometryEpoch, visible: [])
         }
         var masks: [Int: CGRect] = [:]
+        var visibleMasks: [CGRect] = []
+        var excludedIDs: [Int] = []
+        var opaqueForeground: [CGRect] = []
         var seenPIDs: Set<Int> = []
         var all: [Int: CGRect] = [:]
         var visible: [[String: Int]] = []
@@ -150,7 +211,17 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
                 visible.append(numeric)
                 identities.append("\(number):\(owner):\(bundle):\(title ?? "")")
             }
-            if sensitive && rect.intersects(display) { masks[number] = rect }
+            if sensitive && rect.intersects(display) {
+                masks[number] = rect
+                // Alpha does not prove per-pixel opacity; require compositor exclusion.
+                visibleMasks.append(contentsOf: privateMasks(rect, foreground: opaqueForeground,
+                                                             excluded: excludedAppPIDs.contains(pid)))
+            }
+            if excludedAppPIDs.contains(pid) && rect.intersects(display) { excludedIDs.append(number) }
+            if (row[kCGWindowAlpha as String] as? Double ?? 0) >= 0.999,
+               (row[kCGWindowLayer as String] as? Int) == 0 {
+                opaqueForeground.append(rect)
+            }
         }
         bundles = bundles.filter { seenPIDs.contains($0.key) }
         let digest = Data(SHA256.hash(data: Data(identities.joined(separator: "\n").utf8)))
@@ -160,6 +231,8 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         topology = all; sensitiveIDs = Set(masks.keys)
         var result = Snapshot(time: ProcessInfo.processInfo.systemUptime, windows: masks, valid: true, epoch: epoch, geometryEpoch: geometryEpoch, visible: visible)
         result.scanMS = (result.time - scanStart) * 1000
+        result.masks = visibleMasks
+        result.excludedIDs = excludedIDs.sorted()
         return result
     }
 
@@ -180,7 +253,7 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) { fail() }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sample.isValid,
+        guard !quietStreamForTest, type == .screen, sample.isValid,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let info = attachments.first, let status = info[.status] as? Int,
               status == SCFrameStatus.complete.rawValue || status == SCFrameStatus.idle.rawValue else { return }
@@ -198,6 +271,21 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         let idleBound = idleReuseIsBound(lastImageBinding, after)
         let timestamp = idle ? (idleBound ? after.time : (lastImageCapture ?? after.time)) :
             sourceTime
+        var current: CGImage?
+        if idle { current = lastImage }
+        else if let buffer = CMSampleBufferGetImageBuffer(sample) {
+            current = image(from: buffer)
+        }
+        guard let cg = current,
+              cg.width == Int(display.width), cg.height == Int(display.height) else { return }
+        if !idle { lastCompleteAt = ProcessInfo.processInfo.systemUptime }
+        emitImage(cg, timestamp: timestamp, after: after, sampledHistory: sampledHistory, idle: idle)
+    }
+
+    func emitImage(_ cg: CGImage, timestamp: Double, after: Snapshot, sampledHistory: [Snapshot],
+                   idle: Bool = false, heartbeat: Bool = false, started: Double? = nil) {
+        guard cg.width == Int(display.width), cg.height == Int(display.height) else { return }
+        let idleBound = idleReuseIsBound(lastImageBinding, after)
         let before = sampledHistory.last { $0.time <= timestamp }
         let relevant = sampledHistory.filter { $0.time >= (before?.time ?? after.time) } + [after]
         var united: [Int: CGRect] = [:]
@@ -209,39 +297,94 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         let age = before.map { timestamp - $0.time } ?? 2
         let closed = (idle && !idleBound) || before == nil || !timestamp.isFinite || timestamp > after.time + 0.1 ||
             after.time - timestamp > 0.5 || age > 0.15 || relevant.contains { !$0.valid } || transition
-        var current: CGImage?
-        if idle { current = lastImage }
-        else if let buffer = CMSampleBufferGetImageBuffer(sample) {
-            CVPixelBufferLockBaseAddress(buffer, .readOnly)
-            defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-            if let base = CVPixelBufferGetBaseAddress(buffer) {
-                let bytes = Data(bytes: base, count: CVPixelBufferGetBytesPerRow(buffer) * CVPixelBufferGetHeight(buffer))
-                if let provider = CGDataProvider(data: bytes as CFData) {
-                    current = CGImage(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer),
-                        bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
-                        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue:
-                            CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue),
-                        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
-                }
-            }
-        }
-        guard let cg = current,
-              cg.width == Int(display.width), cg.height == Int(display.height) else { return }
         if !idle {
             lastImage = cg
+            lastCapturedPrivateWindows = after.windows
             lastImageCapture = timestamp
             // Metadata must cover an unchanged geometry/identity at the source time.
             lastImageBinding = !closed && before?.epoch == after.epoch &&
                 before?.geometryEpoch == after.geometryEpoch ? after : nil
         }
         let frame = CGRect(x: 0, y: 0, width: display.width, height: display.height)
-        let masks = closed ? [frame] : united.values.compactMap { rect -> CGRect? in
-            let local = rect.insetBy(dx: -24, dy: -24).offsetBy(dx: -display.minX, dy: -display.minY).integral.intersection(frame)
+        let masks = closed ? [frame] : relevant.flatMap { $0.masks }.compactMap { rect -> CGRect? in
+            let local = rect.offsetBy(dx: -display.minX, dy: -display.minY).integral.intersection(frame)
             return local.isNull || local.isEmpty ? nil : local
         }
         sequence += 1
         publish(cg, masks: masks, capture: timestamp.isFinite ? timestamp : after.time,
-                sequence: sequence, closed: closed, transition: transition, age: age, epoch: after.epoch, idle: idle, windows: after.visible, scanMS: after.scanMS, raw: raw)
+                sequence: sequence, closed: closed, transition: transition, age: age, epoch: after.epoch, idle: idle, windows: after.visible, scanMS: after.scanMS, raw: raw, heartbeat: heartbeat, started: started, excludedIDs: after.excludedIDs)
+    }
+
+    func startHeartbeat() {
+        // Screenshot control matches the existing one-shot helper's accepted options.
+        let configuration = SCStreamConfiguration()
+        configuration.width = Int(display.width); configuration.height = Int(display.height)
+        configuration.showsCursor = true
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(67))
+        timer.setEventHandler { [weak self] in
+            guard let self, !self.heartbeatInFlight else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let currentPrivate = self.metadataQueue.sync { self.history.last?.windows ?? [:] }
+            let moved = currentPrivate != self.lastCapturedPrivateWindows
+            guard now - self.lastHeartbeatAt >= (moved ? 1.0 / 15 : 0.5),
+                  moved || now - self.lastCompleteAt >= 0.5 else { return }
+            self.heartbeatInFlight = true
+            self.lastHeartbeatAt = ProcessInfo.processInfo.systemUptime
+            Task { @MainActor in
+                // Read metadata BEFORE the real screenshot; never re-date a cached image.
+                let before = self.metadataQueue.sync { self.snapshot() }
+                let started = ProcessInfo.processInfo.systemUptime
+                do {
+                    let sample = try await screenshotSample(filter: self.filter, configuration: configuration).value
+                    let source = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+                    guard sample.isValid, CMSampleBufferDataIsReady(sample), CMSampleBufferGetNumSamples(sample) == 1,
+                          source.isFinite, source >= started,
+                          source <= ProcessInfo.processInfo.systemUptime,
+                          let buffer = CMSampleBufferGetImageBuffer(sample),
+                          CVPixelBufferGetWidth(buffer) == Int(self.display.width),
+                          CVPixelBufferGetHeight(buffer) == Int(self.display.height),
+                          let image = image(from: buffer) else { throw NSError(domain: "LocalCapture", code: -1) }
+                    // Screenshot buffers have no SCStream status attachment on this SDK.
+                    // Data-ready, single-image readiness is their supported complete contract.
+                    let info = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]]
+                    if let status = info?.first?[.status] as? Int, status != SCFrameStatus.complete.rawValue {
+                        throw NSError(domain: "LocalCapture", code: -2)
+                    }
+                    let (after, history) = self.metadataQueue.sync { () -> (Snapshot, [Snapshot]) in
+                        let after = self.snapshot()
+                        let history = self.history + [before]
+                        self.history.append(after)
+                        return (after, history.sorted { $0.time < $1.time })
+                    }
+                    self.queue.async {
+                        self.heartbeatInFlight = false
+                        // A newer streamed frame already satisfies this capture interval.
+                        guard self.lastCompleteAt <= started else { return }
+                        self.emitImage(image, timestamp: source, after: after,
+                                       sampledHistory: history, heartbeat: true, started: started)
+                    }
+                } catch {
+                    // Failed requests export only a fully masked slate and a numeric code.
+                    let code = (error as NSError).code
+                    self.queue.async {
+                        self.heartbeatInFlight = false
+                        guard let context = CGContext(data: nil, width: Int(self.display.width), height: Int(self.display.height),
+                            bitsPerComponent: 8, bytesPerRow: Int(self.display.width) * 4,
+                            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
+                            let slate = context.makeImage() else { return }
+                        self.sequence += 1
+                        publish(slate, masks: [CGRect(origin: .zero, size: self.display.size)], capture: started,
+                            sequence: self.sequence, closed: true, transition: false, age: 0,
+                            raw: self.raw, heartbeat: true, errorCode: code, started: started)
+                    }
+                }
+            }
+        }
+        heartbeatTimer = timer
+        timer.resume()
+
     }
 }
 
@@ -251,7 +394,8 @@ struct NativeStream {
         let args = CommandLine.arguments
         let idleTest = args.count == 3 && args[1] == "--self-test-idle" && ["same", "geometry", "identity", "missing"].contains(args[2])
         let rawTest = args.count == 2 && args[1] == "--self-test-raw"
-        if (args.count == 2 && args[1] == "--self-test") || idleTest || rawTest {
+        let occlusionTest = args.count == 3 && args[1] == "--self-test-occlusion" && ["opaque", "transparent", "unexcluded"].contains(args[2])
+        if (args.count == 2 && args[1] == "--self-test") || idleTest || rawTest || occlusionTest {
             guard let context = CGContext(data: nil, width: 128, height: 96, bitsPerComponent: 8,
                                           bytesPerRow: 512, space: CGColorSpaceCreateDeviceRGB(),
                                           bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { fail() }
@@ -262,6 +406,14 @@ struct NativeStream {
             var masks = [rect]
             var closed = false
             var timestamp = ProcessInfo.processInfo.systemUptime
+            if occlusionTest {
+                let privateRect = CGRect(x: 5, y: 5, width: 105, height: 80)
+                masks = privateMasks(privateRect,
+                    foreground: args[2] == "transparent" ? [] : [CGRect(x: 20, y: 20, width: 70, height: 50)],
+                    excluded: args[2] != "unexcluded").map {
+                        $0.intersection(CGRect(x: 0, y: 0, width: 128, height: 96))
+                    }.filter { !$0.isEmpty }
+            }
             if idleTest {
                 let original = Snapshot(time: 10, windows: [1: rect], valid: true, epoch: 1, geometryEpoch: 1, visible: [])
                 let current = Snapshot(time: 20, windows: [1: rect], valid: true,
@@ -296,11 +448,12 @@ struct NativeStream {
             config.pixelFormat = kCVPixelFormatType_32BGRA
             config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
             config.queueDepth = 3; config.showsCursor = true
-            let capture = Capture(policy: policy, display: requested, raw: raw)
+            let capture = Capture(policy: policy, display: requested, filter: filter, excludedAppPIDs: Set(excluded.map { Int($0.processID) }), raw: raw)
             capture.metadataQueue.sync { capture.startMetadata() }
             let stream = SCStream(filter: filter, configuration: config, delegate: capture)
             try stream.addStreamOutput(capture, type: .screen, sampleHandlerQueue: capture.queue)
             try await stream.startCapture()
+            capture.queue.async { capture.startHeartbeat() }
             // Retain the stream and callback owner for the entire worker lifetime.
             while true {
                 try await Task.sleep(nanoseconds: 1_000_000_000)

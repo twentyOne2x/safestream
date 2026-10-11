@@ -44,8 +44,8 @@ def test_synthetic_frame_masks_before_output_and_uses_top_left_coordinates(argum
     assert image.getpixel((8, 60)) == (255, 255, 255)
     assert image.getpixel((38, 34)) == (255, 255, 255)
     assert all(not isinstance(value, str) for key, value in metadata.items() if key != "pixel_format")
-    assert set(metadata) == {"capture_monotonic", "emitted_monotonic", "sequence",
-        "width", "height", "masks", "windows", "pixel_format", "private_window_count", "fail_closed",
+    assert set(metadata) == {"capture_monotonic", "capture_started_monotonic", "emitted_monotonic", "sequence",
+        "width", "height", "masks", "windows", "pixel_format", "excluded_window_ids", "screenshot_heartbeat", "capture_error_code", "private_window_count", "fail_closed",
         "transition_guard", "metadata_age_ms", "scene_epoch", "idle_replay", "snapshots_ms", "encode_ms"}
 
 
@@ -88,6 +88,19 @@ def test_idle_same_subject_can_refresh_only_with_bound_compositor_idle_event():
     assert image.getpixel((80, 80)) == (255, 255, 255)
 
 
+@pytest.mark.parametrize("opacity", ["opaque", "transparent", "unexcluded"])
+def test_private_geometry_clips_only_with_compositor_exclusion_receipt(opacity):
+    result = subprocess.run([str(HELPER), "--self-test-occlusion", opacity],
+                            capture_output=True, check=True, timeout=5)
+    metadata, image = frame(result.stdout)
+    assert image.getpixel((10, 10)) == (14, 17, 20)
+    expected = (255, 255, 255) if opacity == "opaque" else (14, 17, 20)
+    assert image.getpixel((50, 50)) == expected
+    if opacity == "opaque":
+        assert not any(r["x"] <= 50 < r["x"] + r["w"] and
+                       r["y"] <= 50 < r["y"] + r["h"] for r in metadata["masks"])
+
+
 @pytest.mark.skipif(os.environ.get("SAFESTREAM_NATIVE_LIVE_TEST") != "1",
                     reason="Explicit local synthetic-window capture check")
 def test_live_synthetic_private_window_is_dark(tmp_path):
@@ -101,6 +114,7 @@ app.setActivationPolicy(.accessory)
 let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 320, height: 200),
                       styleMask: [.titled], backing: .buffered, defer: false)
 window.title = "SAFESTREAM SYNTHETIC PRIVATE TEST"
+window.level = .floating
 window.backgroundColor = .white
 window.orderFrontRegardless()
 app.run()
@@ -120,11 +134,13 @@ app.run()
             "private_titles": ["SAFESTREAM SYNTHETIC PRIVATE TEST"]}))
         capture = subprocess.Popen([str(HELPER), str(monitor["left"]),
             str(monitor["top"]), str(monitor["width"]), str(monitor["height"]),
-            str(policy), "15", "--raw"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            str(policy), "15", "--raw"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=dict(os.environ, SAFESTREAM_NATIVE_TEST_QUIET_STREAM="1"))
         received = b""
-        deadline = time.monotonic() + 12
+        deadline = time.monotonic() + 25
         passed = False
         last_metadata = None
+        healthy = []
         while time.monotonic() < deadline:
             if not select.select([capture.stdout], [], [], 0.2)[0]:
                 continue
@@ -139,6 +155,7 @@ app.run()
                     break
                 metadata, image = frame(received[:total])
                 last_metadata = metadata
+                assert metadata["capture_error_code"] == 0, metadata["capture_error_code"]
                 received = received[total:]
                 # Primary display origin and AppKit bottom-left coordinates.
                 point = (150, monitor["height"] - 150)
@@ -148,11 +165,18 @@ app.run()
                                for r in metadata["masks"])
                     assert image.getpixel(point) == (14, 17, 20)
                     assert "SAFESTREAM SYNTHETIC" not in json.dumps(metadata)
-                    passed = True
-                    break
+                    healthy.append(metadata)
+                    assert metadata["screenshot_heartbeat"]  # Real SDK backstop, not streaming fixtures.
+                    if metadata["screenshot_heartbeat"]:
+                        assert not metadata["idle_replay"]
+                        assert metadata["capture_started_monotonic"] <= metadata["capture_monotonic"] <= metadata["emitted_monotonic"]
+                        assert metadata["emitted_monotonic"] - metadata["capture_monotonic"] <= 0.5
+                    passed = len(healthy) >= 12 and (healthy[-1]["capture_monotonic"] - healthy[0]["capture_monotonic"] >= 2)
+                    if passed:
+                        break
             if passed:
                 break
-        assert passed, ("No healthy masked synthetic frame arrived", capture.poll(), {k: v for k, v in (last_metadata or {}).items() if k not in ("masks", "windows")})
+        assert passed, ("No healthy masked synthetic frame arrived", capture.poll(), len(healthy), json.dumps({k: v for k, v in (last_metadata or {}).items() if k not in ("masks", "windows")}))
     finally:
         for process in (capture, window):
             if process is not None:
