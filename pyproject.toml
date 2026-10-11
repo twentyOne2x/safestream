@@ -1,0 +1,17 @@
+[project]
+name = "safestream"
+version = "0.2.0"
+description = "Local screen redaction with processed-only OBS output"
+requires-python = ">=3.11"
+dependencies = [
+  "mss==10.2.0",
+  "pillow==12.3.0",
+  "obsws-python==1.8.0",
+]
+
+[dependency-groups]
+dev = ["pytest==9.1.1"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
