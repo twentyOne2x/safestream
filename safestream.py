@@ -28,7 +28,7 @@ MAX_AGE = 5.0
 
 def encode(image):
     out = BytesIO()
-    image.save(out, format="PNG")
+    image.save(out, format="PNG", compress_level=1)
     return out.getvalue()
 
 
@@ -99,7 +99,7 @@ const age=Number(r.headers.get('X-Safestream-Age'))*1000;
 const b=await createImageBitmap(await r.blob());
 if(age+performance.now()-started>{MAX_AGE * 1000}){{b.close();throw Error()}}
 c.width=b.width;c.height=b.height;ctx.drawImage(b,0,0);b.close();last=started-age;
-}}catch(e){{last=0;blank()}}setTimeout(tick,180)}}tick();
+}}catch(e){{last=0;blank()}}setTimeout(tick,40)}}tick();
 </script></body></html>""".encode()
 
 
@@ -149,7 +149,7 @@ def make_server(frames, port, token):
 
 def policy(path):
     data = json.loads(path.read_text()) if path.exists() else {}
-    mode = data.get("mode", "protective")
+    mode = data.get("mode", "selective")
     terms = data.get("terms", [])
     terms_file = ROOT / "private-terms.txt"
     if terms_file.exists():
@@ -159,9 +159,18 @@ def policy(path):
     return Redactor(mode=mode, terms=terms, regions=data.get("regions", []), backend=backend), mode
 
 
-def capture_loop(frames, redactor, monitor, stop, fps, fixture=None):
+def capture_loop(frames, redactor, monitor, stop, fps, fixture=None, policy_path=None):
     import mss
     with mss.MSS() as capture:
+        if sys.platform == "darwin" and not fixture:
+            from live_frames import run_live
+            try:
+                run_live(frames, redactor, capture.monitors[monitor], stop, fps,
+                         ROOT, policy_path, PAUSE)
+            except Exception as error:
+                frames.pause("capture-failed")
+                logging.warning("Privacy paused (%s)", type(error).__name__)
+            return
         previous, processed, counts = None, None, None
         while not stop.is_set():
             started = time.monotonic()
@@ -218,13 +227,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--monitor", type=int, default=1)
     parser.add_argument("--port", type=int, default=8791)
-    parser.add_argument("--fps", type=float, default=2)
+    parser.add_argument("--fps", type=float, default=15)
     parser.add_argument("--policy", type=Path, default=ROOT / "local-policy.json")
     parser.add_argument("--fixture", type=Path, help="Synthetic image for local verification")
     parser.add_argument("--setup-obs", action="store_true")
     args = parser.parse_args()
-    if not 0.1 <= args.fps <= 10 or not 1024 <= args.port <= 65535:
-        parser.error("Use FPS 0.1..10 and a local port 1024..65535")
+    if not 1 <= args.fps <= 30 or not 1024 <= args.port <= 65535:
+        parser.error("Use FPS 1..30 and a local port 1024..65535")
     import mss
     with mss.MSS() as capture:
         if not 1 <= args.monitor < len(capture.monitors):
@@ -235,7 +244,9 @@ def main():
             size = image.size
     redactor, mode = policy(args.policy)
     policy_digest = hashlib.sha256(json.dumps({"mode": mode, "backend": redactor.backend, "terms": redactor.terms,
-                                               "regions": redactor.regions, "fps": args.fps},
+                                               "regions": redactor.regions, "fps": args.fps,
+                                               "native_policy": args.policy.read_text() if args.policy.exists() else "{}",
+                                               "capture_version": "continuous-v1"},
                                               sort_keys=True).encode()).hexdigest()
     prior = json.loads(STATE.read_text()) if STATE.exists() else {}
     token = prior.get("token") or secrets.token_urlsafe(24)
@@ -267,7 +278,8 @@ def main():
     signal.signal(signal.SIGINT, terminate)
     signal.signal(signal.SIGTERM, terminate)
     worker = threading.Thread(target=capture_loop,
-                              args=(frames, redactor, args.monitor, stop, args.fps, args.fixture), daemon=True)
+                              args=(frames, redactor, args.monitor, stop, args.fps, args.fixture,
+                                    args.policy if args.policy.exists() else ROOT / "policy.example.json"), daemon=True)
     serving = threading.Thread(target=server.serve_forever, daemon=True)
     serving.start()
     try:
@@ -281,7 +293,7 @@ def main():
                                           on_plan=lambda plan: save_state({**state, "obs": plan}))
         save_state(state)
         print(f"Safestream: {mode} mode. Preview: {url}", flush=True)
-        print("OCR may miss text. Protective mode hides recognized text; imagery needs private regions.", flush=True)
+        print("Private windows are covered. New pixels wait for local classification; OCR may miss unfamiliar details.", flush=True)
         worker.start()
         while not stop.wait(0.5):
             if not worker.is_alive():

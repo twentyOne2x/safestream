@@ -1,5 +1,7 @@
 {
-  "mode": "protective",
+  "mode": "selective",
   "terms": [],
-  "regions": []
+  "regions": [],
+  "private_apps": [],
+  "private_titles": []
 }

@@ -51,7 +51,7 @@ def install_output(url, size, prior=None, on_plan=None):
                 raise RuntimeError("Existing OBS scene lacks owned output")
         settings = {"url": url, "width": size[0], "height": size[1],
                     "is_local_file": False, "shutdown": False, "restart_when_active": False,
-                    "fps_custom": True, "fps": 10, "webpage_control_level": 0}
+                    "fps_custom": True, "fps": 30, "webpage_control_level": 0}
         if SOURCE in inputs:
             if any(old.input_settings.get(key) != value for key, value in settings.items()):
                 client.set_input_settings(SOURCE, settings, True)
