@@ -56,6 +56,17 @@ class RedactionTests(unittest.TestCase):
         self.assertEqual(safe.getpixel((40, 35)), (0, 0, 0))
         self.assertEqual(safe.getpixel((40, 75)), (0, 0, 0))
 
+    def test_native_parser_refuses_bad_bounds_without_raw_fallback(self):
+        import json
+        import subprocess
+        redactor = Redactor(backend="vision")
+        for row in [{"text": "private", "x": -1, "y": 0, "w": 10, "h": 10},
+                    {"text": "private", "x": 0, "y": 0, "w": 101, "h": 10},
+                    {"text": "private", "x": 0, "y": 0, "w": True, "h": 10}]:
+            result = subprocess.CompletedProcess([], 0, stdout=json.dumps([row]).encode())
+            with patch("redaction.subprocess.run", return_value=result), self.assertRaises(RuntimeError):
+                redactor.redact(Image.new("RGB", (100, 100), "white"))
+
     def test_manual_region_even_when_no_text(self):
         image, safe, counts = self.run_frame([], regions=[{"x": .5, "y": 0, "w": .5, "h": 1}])
         self.assertEqual(safe.getpixel((600, 100)), (0, 0, 0))
@@ -82,6 +93,7 @@ class RedactionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "^Local text recognition failed$"):
                 redactor._ocr(Image.new("RGB", (100, 100)))
             self.assertEqual(call.call_args.kwargs["timeout"], 8)
+            self.assertEqual(call.call_args.kwargs["env"]["OMP_THREAD_LIMIT"], "1")
             self.assertEqual(call.call_args.args[0],
                              ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "11", "tsv"])
             self.assertTrue(call.call_args.kwargs["input"].startswith(b"\x89PNG\r\n\x1a\n"))

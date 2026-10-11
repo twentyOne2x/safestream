@@ -38,3 +38,16 @@ masks all recognized text. Selective mode needs private terms for family/project
 names, conservative name/address rules, and explicit honest coverage limits.
 Non-text identifying imagery requires manual regions or whole-screen blackout.
 Do not expose or record raw capture, OCR text, OBS credentials or private terms.
+
+2026-10-11 operator proof: Original Tesseract path exceeded publication freshness
+on the full desktop. Mac capture now uses ScreenCaptureKit (three-second bound),
+with local Vision fast regions for protective mode and accurate text for selective
+mode. Five live samples were fresh and redacted; measured capture about 0.79s,
+recognition about 0.39s on that sampled screen. These are local observations,
+not a frame-rate guarantee. Native selective OBS readback covered seven complete
+synthetic private rows and preserved the eighth public row's pixels exactly.
+Worker death and bad-image processing produced a slate; same-runtime recovery,
+OBS restart, and repeated launcher selection were exercised. No broadcast started.
+An OBS crash occurred during setup/reload; normal-mode recovery retained the scene.
+Routine reuse now avoids unnecessary browser settings/reload calls. First-setup
+ownership is journaled before creation and a retained empty scene can resume.

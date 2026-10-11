@@ -54,3 +54,29 @@ def test_active_broadcast_is_preserved():
     with patch("obs_setup.connect", return_value=control), pytest.raises(RuntimeError):
         install_output("http://127.0.0.1:8791/owned", (1440, 900), owner())
     assert not any(call[0].startswith(("set_", "create_")) for call in control.method_calls)
+
+
+def test_first_setup_journals_ownership_before_interrupted_creation():
+    control = client(existing=False)
+    plans = []
+    def create(*args):
+        assert plans and plans[0]["phase"] == "creating"
+        raise RuntimeError("synthetic interruption")
+    control.create_input.side_effect = create
+    with patch("obs_setup.connect", return_value=control), pytest.raises(RuntimeError):
+        install_output("http://127.0.0.1:8791/owned", (1440, 900), on_plan=plans.append)
+    control.create_scene.assert_called_once_with(SCENE)
+    assert plans[0]["scene"] == SCENE and plans[0]["source"] == SOURCE
+
+
+def test_interrupted_owned_empty_scene_resumes_without_duplicate_scene():
+    control = client()
+    control.get_input_list.return_value = Data(inputs=[])
+    control.get_scene_item_list.side_effect = [Data(scene_items=[]), Data(scene_items=[{"sourceName": SOURCE}])]
+    prior = owner()
+    prior["obs"]["phase"] = "creating"
+    with patch("obs_setup.connect", return_value=control):
+        receipt = install_output(prior["url"], (1440, 900), prior)
+    control.create_scene.assert_not_called()
+    control.create_input.assert_called_once()
+    assert receipt["previous_scene"] == "Scene"

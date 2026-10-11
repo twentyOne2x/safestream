@@ -6,3 +6,4 @@ private-terms.txt
 local-policy.json
 artifacts/
 *.log
+.build/

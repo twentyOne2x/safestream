@@ -25,7 +25,7 @@ def connect():
             time.sleep(0.5)
 
 
-def install_output(url, size, prior=None):
+def install_output(url, size, prior=None, on_plan=None):
     client = connect()
     try:
         if (client.get_stream_status().output_active or client.get_record_status().output_active
@@ -39,21 +39,28 @@ def install_output(url, size, prior=None):
         # Check the entire ownership boundary before changing any existing object.
         if exists or SOURCE in inputs:
             owner = prior.get("obs", {})
-            if not exists or SOURCE not in inputs or owner.get("scene") != SCENE or owner.get("source") != SOURCE:
+            if not exists or owner.get("scene") != SCENE or owner.get("source") != SOURCE:
                 raise RuntimeError("Existing OBS objects have another owner")
-            old = client.get_input_settings(SOURCE)
             items = client.get_scene_item_list(SCENE).scene_items
-            if (old.input_kind != "browser_source" or old.input_settings.get("url") != prior.get("url")
-                    or len(items) != 1 or items[0]["sourceName"] != SOURCE):
-                raise RuntimeError("Existing OBS scene differs from saved ownership")
+            if SOURCE in inputs:
+                old = client.get_input_settings(SOURCE)
+                if (old.input_kind != "browser_source" or old.input_settings.get("url") != prior.get("url")
+                        or len(items) != 1 or items[0]["sourceName"] != SOURCE):
+                    raise RuntimeError("Existing OBS scene differs from saved ownership")
+            elif owner.get("phase") != "creating" or items:
+                raise RuntimeError("Existing OBS scene lacks owned output")
         settings = {"url": url, "width": size[0], "height": size[1],
                     "is_local_file": False, "shutdown": False, "restart_when_active": False,
                     "fps_custom": True, "fps": 10, "webpage_control_level": 0}
         if SOURCE in inputs:
-            client.set_input_settings(SOURCE, settings, True)
+            if any(old.input_settings.get(key) != value for key, value in settings.items()):
+                client.set_input_settings(SOURCE, settings, True)
             item = client.get_scene_item_id(SCENE, SOURCE).scene_item_id
         else:
-            client.create_scene(SCENE)
+            if on_plan:
+                on_plan({"scene": SCENE, "source": SOURCE, "previous_scene": previous, "phase": "creating"})
+            if not exists:
+                client.create_scene(SCENE)
             item = client.create_input(SCENE, SOURCE, "browser_source", settings, True).scene_item_id
         items = client.get_scene_item_list(SCENE).scene_items
         if len(items) != 1 or items[0]["sourceName"] != SOURCE:
@@ -66,7 +73,6 @@ def install_output(url, size, prior=None):
         })
         client.set_scene_item_enabled(SCENE, item, True)
         client.set_current_program_scene(SCENE)
-        client.press_input_properties_button(SOURCE, "refreshnocache")
         return {"scene": SCENE, "source": SOURCE, "previous_scene": previous,
                 "canvas": [video.base_width, video.base_height]}
     finally:

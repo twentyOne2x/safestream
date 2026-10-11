@@ -7,6 +7,8 @@ import logging
 import os
 import secrets
 import signal
+import sys
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,10 +53,12 @@ class SafeFrames:
 
     def publish(self, processed, captured_at, counts):
         # Encoding completes before replacing the one immutable publication object.
+        encoding_at = self.clock()
         data = encode(processed)
         with self.lock:
             self.data, self.captured_at = data, captured_at
             self.status, self.counts = "redacted", dict(counts)
+            self.counts["encode_ms"] = round((self.clock() - encoding_at) * 1000)
             self.sequence += 1
 
     def pause(self, reason="paused"):
@@ -66,10 +70,13 @@ class SafeFrames:
         with self.lock:
             age = max(0.0, self.clock() - self.captured_at)
             healthy = self.status == "redacted" and age <= MAX_AGE
+            measured = self.status == "redacted"
+            counts = self.counts if healthy else {"last_" + key: value for key, value in self.counts.items()
+                                                  if key.endswith("_ms")}
             return (self.data if healthy else self.blank,
                     {"state": self.status if healthy else "paused",
-                     "age_seconds": round(age, 3) if healthy else None,
-                     "sequence": self.sequence, **(self.counts if healthy else {})})
+                     "age_seconds": round(age, 3) if measured else None,
+                     "sequence": self.sequence, **counts})
 
 
 def viewer():
@@ -148,7 +155,8 @@ def policy(path):
     if terms_file.exists():
         terms += [x.strip() for x in terms_file.read_text().splitlines()
                   if x.strip() and not x.lstrip().startswith("#")]
-    return Redactor(mode=mode, terms=terms, regions=data.get("regions", [])), mode
+    backend = "vision" if sys.platform == "darwin" else "tesseract"
+    return Redactor(mode=mode, terms=terms, regions=data.get("regions", []), backend=backend), mode
 
 
 def capture_loop(frames, redactor, monitor, stop, fps, fixture=None):
@@ -165,11 +173,25 @@ def capture_loop(frames, redactor, monitor, stop, fps, fixture=None):
                 if fixture:
                     image = Image.open(fixture).convert("RGB")
                 else:
-                    shot = capture.grab(capture.monitors[monitor])
-                    image = Image.frombytes("RGB", shot.size, shot.rgb)
+                    display = capture.monitors[monitor]
+                    if sys.platform == "darwin":
+                        result = subprocess.run([str(ROOT / ".build/native-capture"),
+                                                 *(str(display[key]) for key in ("left", "top", "width", "height"))],
+                                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                                timeout=3, check=True)
+                        image = Image.open(BytesIO(result.stdout)).convert("RGB")
+                        if image.size != (display["width"], display["height"]):
+                            raise ValueError("Capture dimensions differ from selected display")
+                    else:
+                        shot = capture.grab(display)
+                        image = Image.frombytes("RGB", shot.size, shot.rgb)
                 digest = hashlib.blake2b(image.tobytes(), digest_size=16).digest()
                 if digest != previous:
+                    ocr_at = time.monotonic()
                     processed, counts = redactor.redact(image)
+                    counts["capture_ms"] = round((ocr_at - started) * 1000)
+                    counts["ocr_ms"] = round((time.monotonic() - ocr_at) * 1000)
+                    counts["processing_ms"] = round((time.monotonic() - started) * 1000)
                     previous = digest
                 if not stop.is_set() and not PAUSE.exists():
                     frames.publish(processed, started, counts)
@@ -212,7 +234,7 @@ def main():
         with Image.open(args.fixture) as image:
             size = image.size
     redactor, mode = policy(args.policy)
-    policy_digest = hashlib.sha256(json.dumps({"mode": mode, "terms": redactor.terms,
+    policy_digest = hashlib.sha256(json.dumps({"mode": mode, "backend": redactor.backend, "terms": redactor.terms,
                                                "regions": redactor.regions, "fps": args.fps},
                                               sort_keys=True).encode()).hexdigest()
     prior = json.loads(STATE.read_text()) if STATE.exists() else {}
@@ -226,11 +248,14 @@ def main():
         try:
             with urlopen(url + "/status", timeout=1) as response:
                 current = json.loads(response.read(4096))
-            if current.get("state") == "redacted" and isinstance(current.get("sequence"), int):
-                print(f"Safestream is already running. Preview: {url}", flush=True)
-                return
         except Exception:
-            pass
+            current = {}
+        if current.get("state") == "redacted" and isinstance(current.get("sequence"), int):
+            from obs_setup import install_output
+            prior["obs"] = install_output(url, size, prior)
+            save_state(prior)
+            print(f"Safestream is already running. Preview: {url}", flush=True)
+            return
     frames = SafeFrames(size)
     # Bind before spawning capture; a second owner cannot run on the same port.
     server = make_server(frames, args.port, token)
@@ -248,10 +273,12 @@ def main():
     try:
         state = {"pid": os.getpid(), "token": token, "url": url, "monitor": args.monitor,
                  "mode": mode, "size": size, "started_at": time.time(),
+                 "recognition_backend": redactor.backend,
                  "capture_kind": "fixture" if args.fixture else "live", "policy_digest": policy_digest}
         if args.setup_obs:
             from obs_setup import install_output
-            state["obs"] = install_output(url, size, prior)
+            state["obs"] = install_output(url, size, prior,
+                                          on_plan=lambda plan: save_state({**state, "obs": plan}))
         save_state(state)
         print(f"Safestream: {mode} mode. Preview: {url}", flush=True)
         print("OCR may miss text. Protective mode hides recognized text; imagery needs private regions.", flush=True)

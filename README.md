@@ -3,6 +3,11 @@
 Your desktop stays intact. OBS receives a separate view made from frames that
 have already been redacted on your Mac. Captured frames and recognized text are
 processed in memory; they are not sent to a cloud service or written to disk.
+On this Mac, recognition uses Apple's local Vision framework for English, French
+and German, and screen capture uses ScreenCaptureKit. The launcher builds the
+small helpers using Apple's Swift toolchain. Capture is bounded to three seconds.
+Protective mode uses fast text-region recognition; selective mode uses accurate
+recognition to match private words. Both retain the same publication expiry.
 
 Double-click **Safestream.command**. It opens OBS, starts the local redactor, and
 selects the **Safestream** scene. Use that scene when you stream or record. The
@@ -46,8 +51,8 @@ OBS preserves the safe source and its local URL. To roll back the scene selectio
 select the original **Scene** in OBS; the redactor can then be stopped with
 Control-C. No existing scene or audio device is deleted or reconfigured.
 
-Setup on another Mac: install Python 3.11+, uv, Tesseract with English OCR data,
-and OBS 28+. Run `uv sync --frozen --group dev`, enable OBS's authenticated
+Setup on another Mac running macOS 14+: install Python 3.11+, uv, Apple's command line developer
+tools, Tesseract for fallback/tests, and OBS 28+. Run `uv sync --frozen --group dev`, enable OBS's authenticated
 websocket server, and grant screen recording access to the launcher host when
 macOS asks. The Mac launcher reads the existing OBS connection configuration
 locally without printing or passing its password on the command line.
@@ -65,3 +70,4 @@ already-broadcast frames could leak newly appearing information.
 References: [OBS Browser Source](https://obsproject.com/kb/browser-source),
 [OBS websocket protocol](https://github.com/obsproject/obs-websocket/blob/master/docs/generated/protocol.md),
 and [obsws-python SDK example](https://github.com/aatikturk/obsws-python#how-to-use).
+Native recognition follows [Apple's Vision example](https://developer.apple.com/documentation/vision/recognizing-text-in-images).

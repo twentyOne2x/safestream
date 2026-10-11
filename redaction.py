@@ -1,11 +1,14 @@
 """Local OCR redaction. Captured pixels and recognized text never leave this module."""
 
 import math
+import os
+import json
 import re
 import csv
 import subprocess
 import unicodedata
 from io import BytesIO, StringIO
+from pathlib import Path
 
 from PIL import Image, ImageDraw
 
@@ -41,7 +44,10 @@ FIELD = re.compile(r"\b(?:name|prenom|nom|vorname|nachname|address|adresse|cardh
 
 
 class Redactor:
-    def __init__(self, mode="protective", terms=(), regions=()):
+    def __init__(self, mode="protective", terms=(), regions=(), backend="tesseract"):
+        if backend not in ("tesseract", "vision"):
+            raise ValueError("Invalid local recognition backend")
+        self.backend = backend
         if mode not in ("protective", "selective"):
             raise ValueError("Invalid redaction mode")
         if isinstance(terms, str):
@@ -69,10 +75,32 @@ class Redactor:
         try:
             encoded = BytesIO()
             image.save(encoded, format="PNG")
+            if self.backend == "vision":
+                command = [str(Path(__file__).parent / ".build/native-ocr")]
+                if self.mode == "protective":
+                    command.append("--fast")
+                result = subprocess.run(command,
+                                        input=encoded.getvalue(), stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, timeout=8, check=True)
+                rows = json.loads(result.stdout)
+                if not isinstance(rows, list) or len(rows) > 20000:
+                    raise ValueError("Invalid recognition result")
+                fields = ("text", "page_num", "block_num", "par_num", "line_num", "left", "top", "width", "height")
+                data = {field: [] for field in fields}
+                for i, row in enumerate(rows):
+                    if not isinstance(row, dict) or set(row) != {"text", "x", "y", "w", "h"} or not isinstance(row["text"], str):
+                        raise ValueError("Invalid recognition row")
+                    x, y, w, h = (row[key] for key in ("x", "y", "w", "h"))
+                    if any(isinstance(value, bool) or not isinstance(value, int) for value in (x, y, w, h)) or x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > image.width or y + h > image.height:
+                        raise ValueError("Invalid recognition bounds")
+                    for field, value in zip(fields, (row["text"], 1, 1, 1, i + 1, x, y, w, h)):
+                        data[field].append(value)
+                return data
             result = subprocess.run(
                 ["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "11", "tsv"],
                 input=encoded.getvalue(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 timeout=8, check=True,
+                env={"PATH": os.environ.get("PATH", os.defpath), "OMP_THREAD_LIMIT": "1"},
             )
             fields = ("level", "page_num", "block_num", "par_num", "line_num", "word_num",
                       "left", "top", "width", "height", "conf", "text")
